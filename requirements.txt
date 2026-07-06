@@ -1,0 +1,19 @@
+# Core data
+yfinance==1.4.1
+pandas==3.0.2
+numpy==2.4.4
+requests==2.33.1
+
+# HTML parsing — required by pd.read_html() for Wikipedia sector scraping (Stage C / B.5)
+lxml==6.0.2
+
+# Visualisation
+matplotlib==3.10.8
+
+# Jupyter environment
+notebook==7.3.3
+nbformat==5.10.4
+ipykernel==6.29.5
+
+# Convenience
+tqdm==4.67.1

@@ -1,0 +1,70 @@
+version: "3.9"
+
+# ── Shared environment variables ─────────────────────────────────────────────
+# Values here can be overridden in .env (see .env.example)
+x-common-env: &common-env
+  PYTHONUNBUFFERED: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+  # Pass-through — override in .env if you want Jupyter token auth
+  JUPYTER_TOKEN: ${JUPYTER_TOKEN:-}
+
+services:
+
+  # ── 1. Interactive Jupyter notebook ────────────────────────────────────────
+  jupyter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: nasdaq-stage2-screener:latest
+    container_name: stage2_jupyter
+    environment:
+      <<: *common-env
+    ports:
+      - "${JUPYTER_PORT:-8888}:8888"
+    volumes:
+      # Your notebooks — edits inside the container are persisted here
+      - ./notebooks:/app/notebooks
+      # Persistent data: sector_cache.csv, output watchlist CSVs
+      - ./data:/app/data
+    working_dir: /app/notebooks
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8888/api"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  # ── 2. Scheduled headless runner (optional) ────────────────────────────────
+  # Runs the notebook non-interactively via nbconvert on a cron-like schedule.
+  # Disabled by default (profile: scheduled) — enable with:
+  #   docker compose --profile scheduled up
+  #
+  # The SCHEDULE env var uses standard cron syntax (default: weekdays at 18:00 local).
+  # Output notebooks (with cell outputs) are saved to /app/data/runs/.
+  runner:
+    image: nasdaq-stage2-screener:latest
+    container_name: stage2_runner
+    profiles:
+      - scheduled
+    environment:
+      <<: *common-env
+      # Cron schedule — default: Mon-Fri at 18:00
+      SCHEDULE: ${SCHEDULE:-0 18 * * 1-5}
+      NOTEBOOK_NAME: ${NOTEBOOK_NAME:-nasdaq_stage2_screener.ipynb}
+    volumes:
+      - ./notebooks:/app/notebooks
+      - ./data:/app/data
+    # Use supercronic (a cron daemon that logs to stdout) to run the notebook
+    # on schedule. Install it and nbconvert in the entrypoint so we don't
+    # bloat the base image used by the jupyter service.
+    entrypoint: >
+      /bin/sh -c "
+        pip install --quiet supercronic nbconvert &&
+        mkdir -p /app/data/runs &&
+        CRON_FILE=/tmp/crontab.txt &&
+        echo \"$$SCHEDULE /bin/sh /app/run_notebook.sh\" > $$CRON_FILE &&
+        echo \"Scheduled job: [$$SCHEDULE] -> $$NOTEBOOK_NAME\" &&
+        exec supercronic $$CRON_FILE
+      "
+    restart: unless-stopped

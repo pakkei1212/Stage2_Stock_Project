@@ -1,0 +1,8 @@
+.env
+data/
+__pycache__/
+*.pyc
+.DS_Store
+notebooks/.ipynb_checkpoints/
+notebooks/sector_cache.csv
+notebooks/stage2_watchlist_*.csv

@@ -1,0 +1,12 @@
+# Keep the Docker build context lean
+.env
+.git
+.gitignore
+__pycache__
+*.pyc
+*.pyo
+data/
+data/runs/
+notebooks/.ipynb_checkpoints/
+*.egg-info/
+.DS_Store
