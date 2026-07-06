@@ -8,12 +8,54 @@ Dockerised Jupyter environment for the **NASDAQ Stage 2 / Minervini Trend Templa
 | File | Purpose |
 |---|---|
 | `Dockerfile` | Python 3.12-slim image with all dependencies |
-| `docker-compose.yml` | Two services: interactive Jupyter + optional scheduled runner |
+| `docker-compose.yml` | Three services: interactive Jupyter, scheduled notebook runner, scheduled weekly pipeline |
 | `requirements.txt` | Pinned Python dependencies |
-| `run_notebook.sh` | Script used by the runner service to execute the notebook headlessly |
-| `.env.example` | Template for local config overrides (port, schedule, token) |
-| `notebooks/` | Drop your `.ipynb` file here |
-| `data/` | Persistent outputs: `sector_cache.csv`, watchlist CSVs, run archives |
+| `run_notebook.sh` | Script used by the `runner` service to execute the notebook headlessly |
+| `run_weekly.sh` | Script used by the `pipeline` service to run the native-Python weekly pipeline |
+| `.env.example` | Template for local config overrides (port, schedule, token, Anthropic key) |
+| `notebooks/` | Interactive exploration notebook — `nasdaq_stage2_screener.ipynb` |
+| `pipeline/` | Native-Python weekly pipeline: screen → rank → chart → Claude VCP vision analysis |
+| `data/` | Persistent outputs: `sector_cache.csv`, watchlist CSVs, chart PNGs, VCP reports, run archives |
+
+---
+
+## Weekly pipeline (`pipeline/`)
+
+A native-Python (non-notebook) version of the screener, extended with automated chart
+generation and an LLM entry-point pass:
+
+```
+Stage A-C : universe, liquidity/cap filter, sector strength   (pipeline/data_sources.py)
+Stage D-D2: Minervini Trend Template + fundamentals screen    (pipeline/stage_screen.py)
+Stage E   : composite technical+fundamentals ranking          (pipeline/stage_rank.py)
+Stage F   : daily price/volume chart PNG per top candidate    (pipeline/stage_charts.py)
+Stage G   : Claude vision VCP entry-point analysis (top N)    (pipeline/stage_vcp_analysis.py)
+```
+
+Stage G computes Volatility Contraction Pattern signals (pullback depths, volume
+dry-up) numerically from price/volume data first, then sends the chart image
+**plus** those computed numbers to Claude (`claude-opus-4-8` by default) for a
+structured verdict (`is_vcp_pattern`, `pivot_price`, `suggested_stop_loss`,
+`entry_recommendation`, etc.) — the model confirms/narrates the pattern rather
+than detecting it from pixels alone.
+
+Run it directly:
+
+```bash
+docker exec stage2_pipeline python -m pipeline.run_pipeline
+# or locally, from the project root, with dependencies installed:
+python -m pipeline.run_pipeline
+```
+
+Or let it run on a schedule via the `pipeline` service (see below). Set
+`ANTHROPIC_API_KEY` in `.env` first — Stage G is skipped with an error per
+ticker if it's missing. `VCP_TOP_N` (default 20) controls how many top-ranked
+candidates get the paid vision analysis each run.
+
+Outputs:
+- `data/reports/watchlist_YYYYMMDD.csv` — full ranked watchlist (Stage E)
+- `data/reports/vcp_analysis_YYYYMMDD.csv` — VCP verdicts for the top N candidates
+- `data/charts/<SYMBOL>.png` — the chart each verdict was based on
 
 ---
 
@@ -169,3 +211,5 @@ Do **not** expose port 8888 to the public internet without authentication.
 | Sector cache stale | Delete `data/sector_cache.csv` and re-run Stage C |
 | Runner service not starting | Make sure you used `--profile scheduled` flag |
 | Notebook not found in runner | Check `NOTEBOOK_NAME` in `.env` matches the filename in `notebooks/` |
+| Stage G (VCP analysis) errors per ticker | Set `ANTHROPIC_API_KEY` in `.env` |
+| Pipeline sector cache stale | Delete `data/sector_cache.csv` (separate from the notebook's own cache) and re-run |

@@ -26,6 +26,11 @@ RUN pip install --no-cache-dir --upgrade pip \
 # any changes you make inside the container are persisted on your host machine.
 COPY notebooks/ ./notebooks/
 
+# Native-Python weekly pipeline (screen + rank + chart + VCP vision) and the
+# entrypoint scripts used by the scheduled runner/pipeline services.
+COPY pipeline/ ./pipeline/
+COPY run_notebook.sh run_weekly.sh ./
+
 # ── Jupyter config ───────────────────────────────────────────────────────────
 # Disable token auth when running locally behind docker-compose
 # (the token is still printed in logs if you prefer to use it — just remove --NotebookApp.token='')
@@ -38,7 +43,7 @@ RUN jupyter notebook --generate-config && \
 # ── Persistent cache directory ───────────────────────────────────────────────
 # sector_cache.csv and any output CSVs will be written here.
 # Mount this as a volume so the cache survives container restarts.
-RUN mkdir -p /app/data
+RUN mkdir -p /app/data/charts /app/data/reports /app/data/runs
 
 # ── Expose Jupyter port ──────────────────────────────────────────────────────
 EXPOSE 8888

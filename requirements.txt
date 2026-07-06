@@ -4,6 +4,9 @@ pandas==3.0.2
 numpy==2.4.4
 requests==2.33.1
 
+# Claude API — vision-based VCP entry analysis (pipeline/stage_vcp_analysis.py)
+anthropic==0.116.0
+
 # HTML parsing — required by pd.read_html() for Wikipedia sector scraping (Stage C / B.5)
 lxml==6.0.2
 
