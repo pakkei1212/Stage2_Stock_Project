@@ -2,6 +2,7 @@
 
 Ported from notebooks/nasdaq_stage2_screener.ipynb, unchanged logic.
 """
+import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
@@ -11,6 +12,8 @@ import yfinance as yf
 
 from .config import CONFIG
 from .data_sources import batch_download
+
+logger = logging.getLogger(__name__)
 
 
 def compute_stage2_metrics(df, benchmark_series, config=CONFIG):
@@ -75,7 +78,7 @@ def compute_stage2_metrics(df, benchmark_series, config=CONFIG):
 
 
 def run_stage2_screen(tickers, config=CONFIG):
-    print(f"Pulling {config['full_lookback_days']}d history for {len(tickers)} survivors...")
+    logger.info("Pulling %dd history for %d survivors...", config["full_lookback_days"], len(tickers))
     price_data = batch_download(tickers, period=f"{config['full_lookback_days']}d", config=config)
 
     bench_raw = yf.download(config["rs_benchmark"], period=f"{config['full_lookback_days']}d",
@@ -88,8 +91,10 @@ def run_stage2_screen(tickers, config=CONFIG):
         if m:
             m["Symbol"] = t
             rows.append(m)
+        else:
+            logger.debug("%s: insufficient history for Stage D metrics — dropped.", t)
 
-    print(f"Stage D: metrics computed for {len(rows)} tickers.")
+    logger.info("Stage D: metrics computed for %d tickers.", len(rows))
     return pd.DataFrame(rows)
 
 
@@ -110,7 +115,7 @@ def fundamentals_screen(tickers, config=CONFIG, timeout_sec=15):
     uses every fiscal year yfinance exposes (no fixed cap — usually ~4 annual periods).
     """
     rows = []
-    print(f"Fetching fundamentals for {len(tickers)} Stage D survivors...")
+    logger.info("Fetching fundamentals for %d Stage D survivors...", len(tickers))
 
     for i, t in enumerate(tickers):
         info, income_stmt, balance_sheet = {}, pd.DataFrame(), pd.DataFrame()
@@ -124,8 +129,10 @@ def fundamentals_screen(tickers, config=CONFIG, timeout_sec=15):
         ex.shutdown(wait=False)
         try:
             info, income_stmt, balance_sheet = future.result(timeout=timeout_sec)
-        except (FuturesTimeoutError, Exception):
-            print(f"  [{i+1}/{len(tickers)}] {t} timed out")
+        except FuturesTimeoutError:
+            logger.warning("  [%d/%d] %s fundamentals fetch timed out after %ds", i + 1, len(tickers), t, timeout_sec)
+        except Exception:
+            logger.warning("  [%d/%d] %s fundamentals fetch failed", i + 1, len(tickers), t, exc_info=True)
 
         eps = info.get("earningsQuarterlyGrowth", np.nan)
         sales = info.get("revenueGrowth", np.nan)
@@ -166,5 +173,5 @@ def fundamentals_screen(tickers, config=CONFIG, timeout_sec=15):
     fund_df["Fundamentals Score"] = fund_df[
         ["EPS Growth OK", "Sales Growth OK", "EPS Trend OK", "Sales Trend OK", "ROE OK", "Profitable"]
     ].sum(axis=1)
-    print(f"Stage D2: fundamentals scored for {len(fund_df)} tickers.")
+    logger.info("Stage D2: fundamentals scored for %d tickers.", len(fund_df))
     return fund_df

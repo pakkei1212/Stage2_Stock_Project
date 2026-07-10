@@ -16,6 +16,7 @@ Dockerised Jupyter environment for the **NASDAQ Stage 2 / Minervini Trend Templa
 | `notebooks/` | Interactive exploration notebook — `nasdaq_stage2_screener.ipynb` |
 | `pipeline/` | Native-Python weekly pipeline: screen → rank → chart → Claude VCP vision analysis |
 | `data/` | Persistent outputs: `sector_cache.csv`, watchlist CSVs, chart PNGs, VCP reports, run archives |
+| `tests/` | Pytest suite verifying each pipeline stage's output correctness (see [Testing](#testing)) |
 
 ---
 
@@ -32,6 +33,53 @@ Stage F   : daily price/volume chart PNG per top candidate    (pipeline/stage_ch
 Stage G   : Claude vision VCP entry-point analysis (top N)    (pipeline/stage_vcp_analysis.py)
 ```
 
+### Scoring methodology (Stage E)
+
+Each candidate that survives the Stage D screen gets three numbers: a **Technical
+Score**, a **Fundamentals Score**, and a **Composite Score** that combines them.
+
+**Technical Score (0–8)** — one point per Minervini Trend Template criterion that's
+true (`pipeline/stage_screen.py::compute_stage2_metrics`):
+
+| Criterion | Condition |
+|---|---|
+| Price Above MAs | Last close > 150-day MA **and** > 200-day MA |
+| MA150 Above MA200 | 150-day MA > 200-day MA |
+| 200d MA Rising | 200-day MA today > 200-day MA 20 trading days ago (`ma_slope_window`) |
+| MAs Stacked Bullish | 50-day MA > 150-day MA **and** > 200-day MA |
+| Above 52w Low (25%+) | Price is at least 25% above its 52-week low (`above_low_pct`) |
+| Near 52w High | Price is within 25% of its 52-week high (`near_high_pct`) |
+| RS Positive | Stock's 3-month **and** 6-month returns both beat the NASDAQ Composite (`^IXIC`) benchmark |
+| Volume Confirms Uptrend | Over the last 60 trading days, average volume on up days > average volume on down days |
+
+**Fundamentals Score (0–6)** — one point per CANSLIM-style criterion, computed only
+for the (small) Stage D survivor set via `yfinance` (`pipeline/stage_screen.py::fundamentals_screen`):
+
+| Criterion | Condition |
+|---|---|
+| EPS Growth OK | Latest quarterly YoY EPS growth ≥ 20% (`min_quarterly_eps_growth`) |
+| Sales Growth OK | Latest quarterly YoY revenue growth ≥ 10% (`min_quarterly_sales_growth`) |
+| EPS Trend OK | Annual EPS grew year-over-year in **every** fiscal year yfinance exposes |
+| Sales Trend OK | Annual revenue grew year-over-year in every fiscal year exposed |
+| ROE OK | Average return on equity across those years ≥ 17% (`min_roe`) |
+| Profitable | Average net profit margin across those years > 0% (`min_profit_margin`) |
+
+If fundamentals data can't be fetched for a symbol (timeout, missing filings), it
+scores 0 rather than being dropped.
+
+**Composite Score** (`pipeline/stage_rank.py::score_and_rank`):
+
+```
+Composite Score = Technical Score + fundamentals_weight × Fundamentals Score
+Max Score        = 8 + fundamentals_weight × 6
+```
+
+`fundamentals_weight` defaults to `1.0` (`pipeline/config.py`), so Composite Score
+is simply Technical + Fundamentals out of a max of 14 — raise the weight to make
+fundamentals count for more, or set it below 1 to lean more technical. The final
+watchlist is sorted by Composite Score descending, with ties broken by 3-month
+relative strength vs. NASDAQ.
+
 Stage G computes Volatility Contraction Pattern signals (pullback depths, volume
 dry-up) numerically from price/volume data first, then sends the chart image
 **plus** those computed numbers to Claude (`claude-opus-4-8` by default) for a
@@ -47,15 +95,73 @@ docker exec stage2_pipeline python -m pipeline.run_pipeline
 python -m pipeline.run_pipeline
 ```
 
+`docker exec` requires the `stage2_pipeline` container to already exist. It's
+gated behind the `scheduled` Compose profile, so it won't be created by a plain
+`docker compose up jupyter` (or by `docker compose build`). If `docker exec`
+fails with `No such container: stage2_pipeline`, bring it up first:
+
+```bash
+docker compose --profile scheduled up -d --build pipeline
+```
+
+Then retry the `docker exec` command above. This starts the container on its
+cron schedule (`PIPELINE_SCHEDULE`, default Fridays 21:00 UTC) — `docker exec`
+just lets you trigger an on-demand run inside it without waiting for that
+schedule.
+
 Or let it run on a schedule via the `pipeline` service (see below). Set
 `ANTHROPIC_API_KEY` in `.env` first — Stage G is skipped with an error per
 ticker if it's missing. `VCP_TOP_N` (default 20) controls how many top-ranked
 candidates get the paid vision analysis each run.
 
+### Logging
+
+Every stage logs through Python's `logging` module (`pipeline/logging_config.py`)
+instead of `print()` — each run writes to **both**:
+
+- **stdout** — visible via `docker compose logs -f pipeline` or in your terminal
+- **`data/logs/pipeline_<timestamp>.log`** — a full timestamped audit log per run
+  (survives after container log buffers rotate away), including per-ticker drop
+  reasons at `DEBUG` and full tracebacks for any exception
+
+Every stage module logs through its own `logging.getLogger(__name__)`, nested
+under the `pipeline` logger, so log lines are tagged by the stage that produced
+them (`pipeline.data_sources`, `pipeline.stage_screen`, `pipeline.stage_rank`, etc.).
+
+Control verbosity with `LOG_LEVEL` in `.env` (`DEBUG` / `INFO` default / `WARNING` / `ERROR`):
+
+```env
+LOG_LEVEL=DEBUG   # see why individual tickers were dropped at each stage
+```
+
 Outputs:
 - `data/reports/watchlist_YYYYMMDD.csv` — full ranked watchlist (Stage E)
 - `data/reports/vcp_analysis_YYYYMMDD.csv` — VCP verdicts for the top N candidates
 - `data/charts/<SYMBOL>.png` — the chart each verdict was based on
+- `data/logs/pipeline_<timestamp>.log` — full audit log for that run (see [Logging](#logging))
+
+---
+
+## Testing
+
+`tests/` verifies each pipeline stage's output is correct and reasonable using
+synthetic OHLCV/fundamentals data — no network calls, no live yfinance/Claude
+requests, fully deterministic.
+
+```bash
+pip install -r requirements.txt   # includes pytest
+python -m pytest tests/ -v
+```
+
+| File | What it checks |
+|---|---|
+| `test_data_sources_filters.py` | Stage B liquidity/market-cap filters keep exactly the survivors their thresholds imply; Stage C sector relative-strength ranking is arithmetically correct |
+| `test_stage_screen_technical.py` | Stage D: a synthetic strong uptrend scores all 8/8 Technical Score criteria, a sustained downtrend scores near 0, and too-short history returns `None` instead of crashing |
+| `test_stage_screen_fundamentals.py` | Stage D2: strong/weak synthetic financials score 6/6 and 0/6 respectively; missing yfinance data degrades to a 0 score instead of raising |
+| `test_stage_rank.py` | Stage E: `Composite Score = Technical + fundamentals_weight × Fundamentals`, `Max Score` formula, missing-fundamentals rows treated as 0 (not dropped), sort order (Composite desc, RS 3mo tiebreak), and scores staying within their documented bounds |
+| `test_vcp_metrics.py` | Stage G's numeric VCP detection: a textbook decreasing-pullback pattern is flagged as contracting with volume dry-up; a choppy flat series doesn't false-positive; insufficient history returns `None` |
+| `test_stage_charts.py` | Stage F chart rendering: empty data returns `None` gracefully; valid data writes a real, non-empty PNG |
+| `test_ticker_failures.py` | Batch download skips tickers that fail rather than raising |
 
 ---
 

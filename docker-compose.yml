@@ -11,6 +11,8 @@ x-common-env: &common-env
   ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
   ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-opus-4-8}
   VCP_TOP_N: ${VCP_TOP_N:-20}
+  # Pipeline logging verbosity — DEBUG/INFO/WARNING/ERROR (see pipeline/logging_config.py)
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
 
 services:
 
@@ -64,12 +66,12 @@ services:
     # bloat the base image used by the jupyter service.
     entrypoint: >
       /bin/sh -c "
-        pip install --quiet supercronic nbconvert &&
         mkdir -p /app/data/runs &&
-        CRON_FILE=/tmp/crontab.txt &&
+        CRON_FILE=/etc/cron.d/stage2_runner &&
         echo \"$$SCHEDULE /bin/sh /app/run_notebook.sh\" > $$CRON_FILE &&
+        chmod 0644 $$CRON_FILE &&
         echo \"Scheduled job: [$$SCHEDULE] -> $$NOTEBOOK_NAME\" &&
-        exec supercronic $$CRON_FILE
+        exec cron -f
       "
     restart: unless-stopped
 
@@ -93,11 +95,11 @@ services:
     working_dir: /app
     entrypoint: >
       /bin/sh -c "
-        pip install --quiet supercronic &&
         mkdir -p /app/data/reports /app/data/charts &&
-        CRON_FILE=/tmp/pipeline_crontab.txt &&
+        CRON_FILE=/etc/cron.d/stage2_pipeline &&
         echo \"$$PIPELINE_SCHEDULE /bin/sh /app/run_weekly.sh\" > $$CRON_FILE &&
+        chmod 0644 $$CRON_FILE &&
         echo \"Scheduled job: [$$PIPELINE_SCHEDULE] -> pipeline.run_pipeline\" &&
-        exec supercronic $$CRON_FILE
+        exec cron -f
       "
     restart: unless-stopped

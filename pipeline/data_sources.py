@@ -6,6 +6,7 @@ exploration; this module is the native-Python copy used by the scheduled
 weekly pipeline.
 """
 import io
+import logging
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
@@ -16,6 +17,24 @@ import requests
 import yfinance as yf
 
 from .config import CONFIG, get_sector_cache_path
+
+logger = logging.getLogger(__name__)
+
+
+def _call_with_retries(fn, retries=3, delay=2, default=None, label="yfinance call"):
+    """Run a callable with retries and graceful fallback on transient network errors."""
+    last_error = None
+    for attempt in range(retries):
+        try:
+            return fn()
+        except Exception as e:
+            last_error = e
+            if attempt < retries - 1:
+                time.sleep(delay * (attempt + 1))
+            else:
+                logger.warning("%s failed after %d attempts: %s", label, retries, e)
+    return default if default is not None else None
+
 
 GICS_TO_YAHOO = {
     "Information Technology": "Technology",
@@ -87,15 +106,15 @@ def fallback_nasdaq100():
 def load_universe(config=CONFIG):
     try:
         universe_df = get_nasdaq_universe()
-        print(f"Full NASDAQ universe: {len(universe_df)} symbols")
+        logger.info("Full NASDAQ universe: %d symbols", len(universe_df))
     except Exception as e:
-        print(f"Primary source failed ({e}). Falling back to NASDAQ-100.")
+        logger.warning("Primary universe source failed (%s). Falling back to NASDAQ-100.", e)
         universe_df = fallback_nasdaq100()
-        print(f"Fallback universe: {len(universe_df)} symbols")
+        logger.info("Fallback universe: %d symbols", len(universe_df))
 
     if config["max_universe_for_testing"]:
         universe_df = universe_df.head(config["max_universe_for_testing"])
-        print(f"(Testing mode: capped at {len(universe_df)} symbols)")
+        logger.info("(Testing mode: capped at %d symbols)", len(universe_df))
     return universe_df
 
 
@@ -110,6 +129,7 @@ def batch_download(tickers, period="1mo", interval="1d", config=CONFIG):
     for i in range(0, len(tickers), batch_size):
         batch = tickers[i:i + batch_size]
         batch_num = i // batch_size + 1
+        data = None
         for attempt in range(config["max_retries"]):
             try:
                 data = yf.download(
@@ -119,10 +139,31 @@ def batch_download(tickers, period="1mo", interval="1d", config=CONFIG):
                 )
                 break
             except Exception as e:
-                print(f"  Batch {batch_num}/{n_batches} attempt {attempt+1} failed: {e}")
+                logger.warning("Batch %d/%d attempt %d failed: %s", batch_num, n_batches, attempt + 1, e)
                 time.sleep(2 * (attempt + 1))
-        else:
-            print(f"  Batch {batch_num}/{n_batches} failed after retries.")
+
+        if data is None or (isinstance(data, pd.DataFrame) and data.empty):
+            logger.warning("Batch %d/%d failed after retries; trying per-ticker fallback.", batch_num, n_batches)
+            for t in batch:
+                try:
+                    single = _call_with_retries(
+                        lambda _t=t: yf.download(
+                            _t, period=period, interval=interval,
+                            auto_adjust=True, progress=False,
+                        ),
+                        retries=config["max_retries"],
+                        delay=2,
+                        default=None,
+                        label=f"{t} history",
+                    )
+                    if single is not None and not (isinstance(single, pd.DataFrame) and single.empty):
+                        if isinstance(single.columns, pd.MultiIndex):
+                            single = single.copy()
+                            single.columns = single.columns.get_level_values(0)
+                        all_data[t] = single.dropna(how="all")
+                except Exception:
+                    continue
+            time.sleep(config["batch_sleep_sec"])
             continue
 
         for t in batch:
@@ -135,7 +176,7 @@ def batch_download(tickers, period="1mo", interval="1d", config=CONFIG):
             except Exception:
                 continue
 
-        print(f"  Batch {batch_num}/{n_batches} done ({len(batch)} tickers).")
+        logger.info("Batch %d/%d done (%d tickers).", batch_num, n_batches, len(batch))
         time.sleep(config["batch_sleep_sec"])
 
     return all_data
@@ -144,7 +185,7 @@ def batch_download(tickers, period="1mo", interval="1d", config=CONFIG):
 def cheap_liquidity_filter(universe_df, config=CONFIG):
     """Stage B part 1: price + dollar-volume filter via 1-month batched data."""
     tickers = universe_df["Symbol"].tolist()
-    print(f"Pulling {config['bulk_lookback_days']}d data for {len(tickers)} tickers...")
+    logger.info("Pulling %dd data for %d tickers...", config["bulk_lookback_days"], len(tickers))
     raw = batch_download(tickers, period=f"{config['bulk_lookback_days']}d", config=config)
 
     survivors, rows = [], []
@@ -162,7 +203,7 @@ def cheap_liquidity_filter(universe_df, config=CONFIG):
         if passes:
             survivors.append(t)
 
-    print(f"Liquidity filter: {len(survivors)} / {len(tickers)} passed.")
+    logger.info("Liquidity filter: %d / %d passed.", len(survivors), len(tickers))
     return survivors, pd.DataFrame(rows)
 
 
@@ -187,7 +228,7 @@ def _get_market_cap_timeout(ticker, timeout_sec=8):
 def market_cap_filter(tickers, config=CONFIG):
     """Stage B part 2: market-cap filter (mid+large cap only)."""
     rows, survivors = [], []
-    print(f"Fetching market cap for {len(tickers)} liquidity survivors...")
+    logger.info("Fetching market cap for %d liquidity survivors...", len(tickers))
     for i, t in enumerate(tickers):
         market_cap = _get_market_cap_timeout(t)
         min_cap = config["min_market_cap"] or 0
@@ -196,9 +237,11 @@ def market_cap_filter(tickers, config=CONFIG):
         rows.append({"Symbol": t, "Market Cap": market_cap, "Passed": passes})
         if passes:
             survivors.append(t)
+        else:
+            logger.debug("%s: market cap %s outside [%s, %s] — dropped.", t, market_cap, min_cap, max_cap)
         time.sleep(0.3)
     cap_df = pd.DataFrame(rows)
-    print(f"Market cap filter: {len(survivors)} / {len(tickers)} are mid/large cap.")
+    logger.info("Market cap filter: %d / %d are mid/large cap.", len(survivors), len(tickers))
     return survivors, cap_df
 
 
@@ -226,7 +269,7 @@ def _build_wikipedia_sector_map():
             df = next((t for t in tables
                        if sym_col in t.columns and sec_col in t.columns), None)
             if df is None:
-                print(f"  {name}: columns not found — skipping")
+                logger.warning("  %s: columns not found — skipping", name)
                 continue
             for _, row in df.iterrows():
                 sym = str(row[sym_col]).strip().replace(".", "-")
@@ -234,9 +277,9 @@ def _build_wikipedia_sector_map():
                 gi = str(row.get(ind_col, "Unknown")).strip()
                 if sym and gs not in ("nan", "", "Unknown"):
                     mapping[sym] = _normalise_gics(gs, gi)
-            print(f"  {name}: {len(df)} tickers")
-        except Exception as e:
-            print(f"  {name} failed: {e}")
+            logger.info("  %s: %d tickers", name, len(df))
+        except Exception:
+            logger.warning("  %s sector lookup failed", name, exc_info=True)
     return mapping
 
 
@@ -270,15 +313,15 @@ def get_sector_map(tickers, cache_path=None, timeout_sec=8, checkpoint_every=25)
     cache_path = cache_path or get_sector_cache_path()
     if os.path.exists(cache_path):
         cache = pd.read_csv(cache_path).set_index("Symbol").to_dict("index")
-        print(f"Loaded {len(cache)} cached sector entries")
+        logger.info("Loaded %d cached sector entries", len(cache))
     else:
         cache = {}
 
     to_classify = [t for t in tickers if t not in cache]
-    print(f"Sector cache hits: {len(tickers)-len(to_classify)} | To classify: {len(to_classify)}")
+    logger.info("Sector cache hits: %d | To classify: %d", len(tickers) - len(to_classify), len(to_classify))
 
     if to_classify:
-        print("Tier 1+2: Wikipedia bulk fetch...")
+        logger.info("Tier 1+2: Wikipedia bulk fetch...")
         wiki_map = _build_wikipedia_sector_map()
 
         still_needed = []
@@ -290,14 +333,16 @@ def get_sector_map(tickers, cache_path=None, timeout_sec=8, checkpoint_every=25)
                 still_needed.append(t)
 
         wiki_hits = len(to_classify) - len(still_needed)
-        print(f"  Wikipedia covered {wiki_hits}/{len(to_classify)}; Tier 3 needed for {len(still_needed)}")
+        logger.info("  Wikipedia covered %d/%d; Tier 3 needed for %d", wiki_hits, len(to_classify), len(still_needed))
         if wiki_hits:
             _save_cache(cache, cache_path)
 
         if still_needed:
-            print(f"Tier 3: yfinance for {len(still_needed)} tickers...")
+            logger.info("Tier 3: yfinance for %d tickers...", len(still_needed))
             for i, t in enumerate(still_needed):
                 sector, industry = _fetch_sector_yf_timeout(t, timeout_sec)
+                if sector in ("Timeout", "Unknown"):
+                    logger.debug("%s: Tier 3 sector lookup returned %s", t, sector)
                 cache[t] = {"Sector": sector, "Industry": industry}
                 if (i + 1) % checkpoint_every == 0:
                     _save_cache(cache, cache_path)
@@ -309,7 +354,7 @@ def get_sector_map(tickers, cache_path=None, timeout_sec=8, checkpoint_every=25)
     df = pd.DataFrame.from_dict(results, orient="index").reset_index() \
         .rename(columns={"index": "Symbol"})
     classified = len(df[~df["Sector"].isin(["Unknown", "Timeout"])])
-    print(f"Stage C: {classified} tickers classified")
+    logger.info("Stage C: %d tickers classified", classified)
     return df
 
 
@@ -363,11 +408,11 @@ def run_stage_abc(config=CONFIG):
 
     sector_strength, merged_with_returns = rank_sector_strength(sector_df, config)
     top_sectors = sector_strength.head(config["top_n_sectors"])["Sector"].tolist()
-    print(f"Top {config['top_n_sectors']} hottest sectors: {top_sectors}")
+    logger.info("Top %d hottest sectors: %s", config["top_n_sectors"], top_sectors)
 
     stage_c_survivors = merged_with_returns[
         merged_with_returns["Sector"].isin(top_sectors)
     ]["Symbol"].tolist()
-    print(f"Stage C: {len(stage_c_survivors)} tickers in top sectors.")
+    logger.info("Stage C: %d tickers in top sectors.", len(stage_c_survivors))
 
     return stage_c_survivors, sector_df, market_cap_stats

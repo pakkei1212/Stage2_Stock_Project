@@ -48,6 +48,11 @@ CONFIG = {
 
     # Output
     "report_dir": os.path.join("data", "reports"),
+
+    # Logging (see pipeline/logging_config.py) — console + a timestamped,
+    # per-run audit log file under log_dir.
+    "log_dir":   os.path.join("data", "logs"),
+    "log_level": os.environ.get("LOG_LEVEL", "INFO"),
 }
 
 

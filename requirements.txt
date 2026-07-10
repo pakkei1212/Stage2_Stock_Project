@@ -20,3 +20,6 @@ ipykernel==6.29.5
 
 # Convenience
 tqdm==4.67.1
+
+# Testing (tests/) — not needed in the runtime image, only for local/CI runs
+pytest==9.1.1

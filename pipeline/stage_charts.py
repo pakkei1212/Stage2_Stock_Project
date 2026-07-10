@@ -4,6 +4,7 @@ Renders a price panel (close + MA50/150/200) and a volume panel (colored by
 up/down day) so both the LLM vision pass and a human reviewer can read
 volume dry-up alongside price contraction.
 """
+import logging
 import os
 
 import matplotlib
@@ -13,6 +14,8 @@ import pandas as pd
 import yfinance as yf
 
 from .config import CONFIG
+
+logger = logging.getLogger(__name__)
 
 
 def fetch_chart_data(ticker, config=CONFIG):
@@ -28,7 +31,7 @@ def fetch_chart_data(ticker, config=CONFIG):
 def render_chart(ticker, df, config=CONFIG):
     """Renders the price+volume PNG for one ticker. Returns the saved file path, or None."""
     if df is None or df.empty:
-        print(f"No data for {ticker} — skipping chart")
+        logger.warning("No data for %s — skipping chart", ticker)
         return None
 
     close = df["Close"]
@@ -75,10 +78,10 @@ def generate_charts(tickers, config=CONFIG):
     """Fetches data and renders a chart for each ticker. Returns {symbol: path}."""
     paths = {}
     for i, t in enumerate(tickers):
-        print(f"  [{i+1}/{len(tickers)}] rendering chart for {t}")
+        logger.debug("  [%d/%d] rendering chart for %s", i + 1, len(tickers), t)
         df = fetch_chart_data(t, config)
         path = render_chart(t, df, config)
         if path:
             paths[t] = path
-    print(f"Stage F: {len(paths)} charts rendered to {config['chart_dir']}")
+    logger.info("Stage F: %d charts rendered to %s", len(paths), config["chart_dir"])
     return paths

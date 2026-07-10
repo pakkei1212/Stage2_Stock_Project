@@ -8,12 +8,15 @@ rather than eyeballing contractions from pixels alone.
 """
 import base64
 import json
+import logging
 import os
 
 import numpy as np
 import pandas as pd
 
 from .config import CONFIG
+
+logger = logging.getLogger(__name__)
 
 VCP_SCHEMA = {
     "type": "object",
@@ -196,24 +199,32 @@ def run_vcp_analysis(candidates_df, chart_paths, config=CONFIG):
         symbol = row["Symbol"]
         chart_path = chart_paths.get(symbol)
         if not chart_path or not os.path.exists(chart_path):
-            print(f"  {symbol}: no chart available, skipping VCP analysis")
+            logger.warning("  %s: no chart available, skipping VCP analysis", symbol)
             continue
 
         from .stage_charts import fetch_chart_data
         df = fetch_chart_data(symbol, config)
         metrics = compute_vcp_metrics(df, config)
         if metrics is None:
-            print(f"  {symbol}: not enough history for contraction analysis, skipping")
+            logger.warning("  %s: not enough history for contraction analysis, skipping", symbol)
             continue
 
-        print(f"  Analyzing {symbol} with {config['anthropic_model']}...")
+        logger.info("  Analyzing %s with %s...", symbol, config["anthropic_model"])
         try:
             verdict = analyze_chart(client, symbol, chart_path, metrics, config)
+            if "error" in verdict:
+                logger.warning("  %s: VCP analysis returned an error verdict: %s", symbol, verdict["error"])
+            else:
+                logger.info(
+                    "  %s: verdict=%s stage=%s confidence=%s",
+                    symbol, verdict.get("entry_recommendation"),
+                    verdict.get("pattern_stage"), verdict.get("confidence"),
+                )
         except Exception as e:
-            print(f"  {symbol}: VCP analysis failed: {e}")
+            logger.error("  %s: VCP analysis failed", symbol, exc_info=True)
             verdict = {"error": str(e)}
 
         rows.append({"Symbol": symbol, **metrics, **verdict})
 
-    print(f"Stage G: VCP analysis complete for {len(rows)} candidates.")
+    logger.info("Stage G: VCP analysis complete for %d candidates.", len(rows))
     return pd.DataFrame(rows)
