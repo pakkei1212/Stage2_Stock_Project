@@ -25,8 +25,10 @@ def test_textbook_vcp_detects_decreasing_contractions_and_volume_dryup():
     # Leg-over-leg ratios should all be < 1.0 (each leg shallower than the last).
     assert all(r < 1.0 for r in metrics["contraction_ratios"])
     assert len(metrics["contraction_ratios"]) == metrics["contraction_count"] - 1
-    # Volume should be drying up (second half lower than first half).
-    assert metrics["volume_dryup_ratio"] < 1.0
+    # Volume dry-up is now measured per contraction leg (pullback), not by a
+    # half-vs-half window split: one average per contraction, later ones lighter.
+    assert len(metrics["volume_leg_avgs"]) == metrics["contraction_count"]
+    assert metrics["volume_dryup_ratio"] < 1.0  # last contraction lighter than the first
     assert metrics["pivot_price_candidate"] > 0
     assert metrics["current_price"] > 0
 

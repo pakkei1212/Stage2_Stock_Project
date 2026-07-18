@@ -129,11 +129,21 @@ def compute_vcp_metrics(df, config=CONFIG, return_details=False):
 
     contraction_ratios, monotonic_fraction, is_contracting = _assess_tightening(contractions)
 
-    half = len(base) // 2
-    vol_first_half = base["Volume"].iloc[:half].mean()
-    vol_second_half = base["Volume"].iloc[half:].mean()
+    # Volume dry-up measured on the contraction legs themselves — the average
+    # volume during each pullback — rather than a half-vs-half split of the whole
+    # window. This reflects supply drying up *as the base tightens* and isn't
+    # distorted by the pre-base period. Ratio = most recent contraction's average
+    # volume vs the first contraction's; <1.0 = drying up.
+    volume = base["Volume"]
+    volume_leg_avgs = []
+    for leg in contraction_legs:
+        seg = volume.iloc[leg["idx_high"]:leg["idx_low"] + 1]
+        vol_avg = float(seg.mean()) if len(seg) else np.nan
+        leg["vol_avg"] = vol_avg
+        volume_leg_avgs.append(vol_avg)
     volume_dryup_ratio = (
-        vol_second_half / vol_first_half if vol_first_half else np.nan
+        volume_leg_avgs[-1] / volume_leg_avgs[0]
+        if len(volume_leg_avgs) >= 2 and volume_leg_avgs[0] else np.nan
     )
 
     last_high_pivots = [v for _, k, v in pivots if k == "high"]
@@ -149,6 +159,7 @@ def compute_vcp_metrics(df, config=CONFIG, return_details=False):
         "contraction_monotonicity": round(float(monotonic_fraction), 3) if monotonic_fraction is not None else None,
         "contractions_decreasing": bool(is_contracting),
         "volume_dryup_ratio": round(float(volume_dryup_ratio), 3) if pd.notna(volume_dryup_ratio) else None,
+        "volume_leg_avgs": [round(v) if pd.notna(v) else None for v in volume_leg_avgs],
         "pivot_price_candidate": round(float(pivot_price_candidate), 2),
         "current_price": round(current_price, 2),
         "pct_below_pivot": round(float(pct_below_pivot) * 100, 2) if pd.notna(pct_below_pivot) else None,
@@ -158,10 +169,7 @@ def compute_vcp_metrics(df, config=CONFIG, return_details=False):
         details = {
             "base": base,
             "pivots": pivots,
-            "contraction_legs": contraction_legs,
-            "half": half,
-            "vol_first_half": float(vol_first_half) if pd.notna(vol_first_half) else None,
-            "vol_second_half": float(vol_second_half) if pd.notna(vol_second_half) else None,
+            "contraction_legs": contraction_legs,  # each carries its "vol_avg"
         }
         return metrics, details
     return metrics
@@ -256,14 +264,15 @@ def render_vcp_annotated_chart(ticker, df, config=CONFIG, out_dir=None):
     colors = ["tab:green" if c >= o else "tab:red"
               for o, c in zip(base["Open"], base["Close"])]
     ax_vol.bar(idx, base["Volume"], color=colors, width=1.0)
-    half = details["half"]
-    if details["vol_first_half"] is not None:
-        ax_vol.hlines(details["vol_first_half"], idx[0], idx[half - 1],
-                      color="tab:blue", linewidth=1.4, label="1st-half avg vol")
-    if details["vol_second_half"] is not None:
-        ax_vol.hlines(details["vol_second_half"], idx[half], idx[-1],
-                      color="tab:orange", linewidth=1.4, label="2nd-half avg vol")
-    ax_vol.axvline(idx[half], color="gray", linestyle=":", linewidth=0.8)
+    # Average volume within each contraction leg (the pullback span) — the basis
+    # for the dry-up ratio. Should step down left-to-right as the base tightens.
+    for n, leg in enumerate(details["contraction_legs"]):
+        vol_avg = leg.get("vol_avg")
+        if vol_avg is None or not np.isfinite(vol_avg):
+            continue
+        ax_vol.hlines(vol_avg, idx[leg["idx_high"]], idx[leg["idx_low"]],
+                      color="tab:purple", linewidth=2.2, zorder=5,
+                      label="per-contraction avg vol" if n == 0 else None)
     ax_vol.set_ylabel("Volume")
     ax_vol.legend(loc="upper left", fontsize=8)
     ax_vol.grid(alpha=0.3)
@@ -285,29 +294,57 @@ def render_vcp_annotated_chart(ticker, df, config=CONFIG, out_dir=None):
 
 def _build_prompt(ticker, metrics):
     return f"""You are analyzing {ticker} for a Minervini-style Volatility Contraction
-Pattern (VCP) entry setup. VCP is a base-building pattern where each pullback
-in a consolidation is shallower than the last (decreasing volatility), ideally
-accompanied by declining volume as the base tightens, ahead of a breakout
-above the pivot (the most recent swing high) on rising volume.
+Pattern (VCP) entry setup. A VCP is a base that forms *within a Stage 2 uptrend*:
+price consolidates through a series of pullbacks, each shallower than the last
+(decreasing volatility), ideally on declining volume as the base tightens, then
+breaks out above the pivot (the most recent swing high) on rising volume.
 
 Computed metrics from the trailing {CONFIG['chart_lookback_days']}-day price/volume
-history (use these as ground truth for the numbers; use the attached chart image
-to judge the visual shape, base structure, and quality of the pattern):
+history (use these as ground truth for the numbers; use the attached candlestick
+chart to judge trend, visual shape, base structure, and quality):
 
-- Contraction depths (successive pullback %, in chronological order): {metrics['contraction_pcts']}
-- Leg-over-leg contraction ratios (each pullback vs. the prior one; <1.0 = shrinking): {metrics['contraction_ratios']}
+- Contraction depths (successive pullback %, chronological): {metrics['contraction_pcts']}
+- Leg-over-leg ratios (each pullback vs. the prior; <1.0 = shrinking): {metrics['contraction_ratios']}
 - Number of contractions detected: {metrics['contraction_count']}
-- Contractions decreasing over time (majority of legs shrinking, most recent leg shallower than the first): {metrics['contractions_decreasing']}
-- Volume ratio, second half of base vs first half (lower = drying up): {metrics['volume_dryup_ratio']}
-- Candidate pivot price (most recent swing high): {metrics['pivot_price_candidate']}
+- Contractions decreasing (majority of legs shrinking, last shallower than first): {metrics['contractions_decreasing']}
+- Avg volume within each contraction, chronological (should step down): {metrics['volume_leg_avgs']}
+- Volume dry-up ratio, last contraction's avg vs the first's (<1.0 = drying up): {metrics['volume_dryup_ratio']}
+- Candidate pivot (most recent swing high, close-based — chart wicks may exceed it): {metrics['pivot_price_candidate']}
 - Current price: {metrics['current_price']}
 - Current price is {metrics['pct_below_pivot']}% below the pivot
 
-Judge whether this is a genuine, tradeable VCP setup or not, using both the
-numbers above and the chart image. Give a specific pivot price and stop-loss
-suggestion if the pattern is valid. Be skeptical — a few pullbacks alone is
-not automatically a VCP; the base should show clear tightening and the chart
-should look like an actual consolidation, not a sustained downtrend."""
+How to judge:
+- Trend first: a VCP is only valid in a Stage 2 uptrend. Confirm on the chart that
+  price is above rising MA50/150/200. If price is below the MAs or they are falling,
+  this is not a VCP entry regardless of the pullback pattern.
+- Tightening: the base should show genuinely decreasing pullbacks; 2-4 contractions
+  is typical and the final one should be tight (roughly <10%, ideally <5%). Confirm
+  visually that candle ranges shrink into the base; many choppy pullbacks of similar
+  or growing depth are a loose, low-quality base, not a VCP.
+- Volume: a quality base dries up — volume should recede across the contractions (the
+  per-contraction averages above stepping down, ratio <1.0) and be lightest in the most
+  recent, tightest ones, then expand clearly (well above the recent average) on the
+  breakout. Confirm on the volume panel. Set volume_dry_up_confirmed when volume clearly
+  recedes across the contractions.
+- Proximity: an actionable entry needs price coiling *near* the pivot (within a few %).
+  Price far below the pivot (e.g. >15-20%) means the base has not formed at the pivot —
+  it is mid-drawdown, not a tradeable setup, even if the pullbacks happen to shrink.
+
+Output guidance:
+- pattern_stage: forming (base building, still loose/early) | mature (tight base formed
+  near pivot, ready) | breaking_out (pushing through the pivot on volume) | failed (broke
+  down / lost the base) | not_present (no VCP).
+- entry_recommendation: buy_now (breaking out above the pivot on rising volume now) |
+  wait_for_breakout (mature tight base near pivot, not yet through) | wait_for_better_setup
+  (genuine uptrend but base immature/loose/extended) | avoid (not a VCP, or not in an uptrend).
+- suggested_stop_loss (only if valid): just below the low of the last contraction, or the
+  base low if tighter — state the level you used in the rationale.
+- pivot_price: the breakout trigger you would actually use (the candidate pivot unless the
+  chart shows a cleaner level).
+
+Be skeptical: shrinking pullback numbers alone do not make a VCP. Require a real uptrend,
+a tight base near the pivot, and a chart that looks like a consolidation — not a sustained
+downtrend or a deep drawdown from a prior high."""
 
 
 def analyze_chart(client, ticker, chart_path, metrics, config=CONFIG):
