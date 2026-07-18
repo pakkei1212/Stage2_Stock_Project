@@ -1,8 +1,10 @@
 """Stage F: daily price chart generation for VCP visual analysis.
 
-Renders a price panel (close + MA50/150/200) and a volume panel (colored by
-up/down day) so both the LLM vision pass and a human reviewer can read
-volume dry-up alongside price contraction.
+Renders a candlestick price panel (OHLC + MA50/150/200) and a volume panel
+(colored by up/down day) so both the LLM vision pass and a human reviewer can
+read volume dry-up alongside price contraction. Candlesticks are used
+deliberately: intraday range is the direct visual signature of the
+volatility contraction VCP is judged on, which a close-only line discards.
 """
 import logging
 import os
@@ -10,6 +12,7 @@ import os
 import matplotlib
 matplotlib.use("Agg")  # headless — no display available in the container
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import yfinance as yf
 
@@ -41,29 +44,52 @@ def render_chart(ticker, df, config=CONFIG):
 
     window = config["chart_lookback_days"]
     plot_df = df.iloc[-window:]
-    plot_close = close.iloc[-window:]
     plot_ma50 = ma50.iloc[-window:]
     plot_ma150 = ma150.iloc[-window:]
     plot_ma200 = ma200.iloc[-window:]
 
     fig, (ax_price, ax_vol) = plt.subplots(
-        2, 1, figsize=(10.24, 7.68), dpi=100, sharex=True,
+        2, 1, figsize=(10.24, 7.68), dpi=250, sharex=True,
         gridspec_kw={"height_ratios": [3, 1]},
     )
 
-    ax_price.plot(plot_close.index, plot_close, label="Close", linewidth=1.4, color="black")
-    ax_price.plot(plot_ma50.index, plot_ma50, label="MA50", linewidth=1, color="tab:orange")
-    ax_price.plot(plot_ma150.index, plot_ma150, label="MA150", linewidth=1, color="tab:blue")
-    ax_price.plot(plot_ma200.index, plot_ma200, label="MA200", linewidth=1, color="tab:red")
-    ax_price.set_title(f"{ticker} — Daily Close with 50/150/200-day MAs")
+    # Integer x-positions so trading days are evenly spaced (no weekend gaps),
+    # the standard layout for candlestick charts.
+    xs = np.arange(len(plot_df))
+    o = plot_df["Open"].to_numpy()
+    h = plot_df["High"].to_numpy()
+    low = plot_df["Low"].to_numpy()
+    c = plot_df["Close"].to_numpy()
+    up = c >= o
+    candle_colors = np.where(up, "tab:green", "tab:red").tolist()
+
+    # Wicks (low->high) and bodies (open<->close), colored by up/down day.
+    ax_price.vlines(xs, low, h, color=candle_colors, linewidth=0.8, zorder=2)
+    ax_price.bar(xs, height=np.abs(c - o), bottom=np.minimum(o, c),
+                 width=0.7, color=candle_colors, linewidth=0, zorder=2)
+
+    ax_price.plot(xs, plot_ma50.to_numpy(), label="MA50", linewidth=1, color="tab:orange", zorder=3)
+    ax_price.plot(xs, plot_ma150.to_numpy(), label="MA150", linewidth=1, color="tab:blue", zorder=3)
+    ax_price.plot(xs, plot_ma200.to_numpy(), label="MA200", linewidth=1, color="tab:purple", zorder=3)
+    ax_price.set_title(f"{ticker} — Daily Candlesticks with 50/150/200-day MAs")
     ax_price.legend(loc="upper left")
     ax_price.grid(alpha=0.3)
 
-    colors = ["tab:green" if c >= o else "tab:red"
-              for o, c in zip(plot_df["Open"], plot_df["Close"])]
-    ax_vol.bar(plot_df.index, plot_df["Volume"], color=colors, width=1.0)
+    ax_vol.bar(xs, plot_df["Volume"].to_numpy(), color=candle_colors, width=0.7)
     ax_vol.set_ylabel("Volume")
     ax_vol.grid(alpha=0.3)
+
+    # Month-boundary x-ticks with date labels (shared across both panels).
+    tick_pos, tick_lab, last_month = [], [], None
+    for i, ts in enumerate(plot_df.index):
+        month = (ts.year, ts.month)
+        if month != last_month:
+            tick_pos.append(i)
+            tick_lab.append(ts.strftime("%Y-%m"))
+            last_month = month
+    ax_vol.set_xticks(tick_pos)
+    ax_vol.set_xticklabels(tick_lab)
+    ax_vol.set_xlim(-0.5, len(plot_df) - 0.5)
 
     plt.tight_layout()
 

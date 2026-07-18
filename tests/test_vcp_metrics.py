@@ -7,7 +7,7 @@ import pandas as pd
 
 from conftest import make_vcp_df
 from pipeline.config import CONFIG
-from pipeline.stage_vcp_analysis import compute_vcp_metrics
+from pipeline.stage_vcp_analysis import _assess_tightening, compute_vcp_metrics
 
 
 def test_textbook_vcp_detects_decreasing_contractions_and_volume_dryup():
@@ -18,13 +18,46 @@ def test_textbook_vcp_detects_decreasing_contractions_and_volume_dryup():
     assert metrics is not None
     assert metrics["contraction_count"] >= 2
     assert metrics["contractions_decreasing"] is True
+    assert metrics["contraction_monotonicity"] == 1.0
     # Each successive pullback should be shallower than the last.
     pcts = metrics["contraction_pcts"]
     assert all(pcts[i] > pcts[i + 1] for i in range(len(pcts) - 1))
+    # Leg-over-leg ratios should all be < 1.0 (each leg shallower than the last).
+    assert all(r < 1.0 for r in metrics["contraction_ratios"])
+    assert len(metrics["contraction_ratios"]) == metrics["contraction_count"] - 1
     # Volume should be drying up (second half lower than first half).
     assert metrics["volume_dryup_ratio"] < 1.0
     assert metrics["pivot_price_candidate"] > 0
     assert metrics["current_price"] > 0
+
+
+def test_assess_tightening_requires_majority_of_legs_to_shrink_not_just_averaged_halves():
+    # A single deep outlier leg (10%) can drag the "first half" average below
+    # the "second half" average even though 3 of 4 legs never shrank and the
+    # base ends on its widest pullback yet (15% > the first leg's 10%). The
+    # old halves-average comparison called this "contracting" (8% < 9.5%);
+    # the leg-over-leg check must not.
+    contractions = [0.10, 0.09, 0.08, 0.01, 0.15]
+
+    ratios, monotonic_fraction, is_contracting = _assess_tightening(contractions)
+
+    assert len(ratios) == len(contractions) - 1
+    assert is_contracting is False
+
+
+def test_assess_tightening_confirms_a_genuinely_tightening_sequence():
+    contractions = [0.20, 0.12, 0.06]
+
+    ratios, monotonic_fraction, is_contracting = _assess_tightening(contractions)
+
+    assert ratios == [0.6, 0.5]
+    assert monotonic_fraction == 1.0
+    assert is_contracting is True
+
+
+def test_assess_tightening_returns_false_for_fewer_than_two_legs():
+    assert _assess_tightening([]) == ([], None, False)
+    assert _assess_tightening([0.10]) == ([], None, False)
 
 
 def test_flat_choppy_series_has_no_clear_contraction_trend():
