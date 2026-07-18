@@ -15,7 +15,7 @@ Dockerised Jupyter environment for the **NASDAQ Stage 2 / Minervini Trend Templa
 | `.env.example` | Template for local config overrides (port, schedule, token, Anthropic key) |
 | `notebooks/` | Interactive exploration notebook — `nasdaq_stage2_screener.ipynb` |
 | `pipeline/` | Native-Python weekly pipeline: screen → rank → chart → Claude VCP vision analysis |
-| `data/` | Persistent outputs: `sector_cache.csv`, watchlist CSVs, chart PNGs, VCP reports, run archives |
+| `data/` | Persistent outputs & caches: `sector_cache.csv`, `market_cap_cache.csv`, `ohlcv_cache/` price history, watchlist CSVs, chart PNGs, VCP reports, logs, run archives |
 | `tests/` | Pytest suite verifying each pipeline stage's output correctness (see [Testing](#testing)) |
 
 ---
@@ -140,6 +140,28 @@ Outputs:
 - `data/charts/<SYMBOL>.png` — the chart each verdict was based on
 - `data/logs/pipeline_<timestamp>.log` — full audit log for that run (see [Logging](#logging))
 
+### OHLCV price cache
+
+To avoid re-downloading full price history for the whole ~4,300-ticker universe
+every run, downloaded OHLCV is cached to Parquet (`pipeline/ohlcv_cache.py`,
+one file per ticker under `data/ohlcv_cache/`). On each run `batch_download`
+serves each ticker one of three ways:
+
+- **cache hit** — cached data is fresh and deep enough → returned from disk, no network
+- **delta** — deep enough but stale → fetch only the days since the last cached bar and append
+- **full** — missing or not enough history → download the whole requested window
+
+Because yfinance uses `auto_adjust=True`, a split/dividend retroactively rescales
+all past prices; the delta merge re-fetches a few days of overlap and, if it
+detects a uniform price shift, rescales the cached history onto the new basis so
+the series stays continuous. Market caps are cached the same way
+(`data/market_cap_cache.csv`, 1-week TTL) since they barely move week to week.
+
+The cache is on by default. Disable it (always fetch fresh) with `OHLCV_CACHE=0`
+in `.env`, or delete `data/ohlcv_cache/` to force a clean rebuild. Tuning knobs
+(`ohlcv_cache_max_age_days`, `ohlcv_cache_overlap_days`, `market_cap_cache_ttl_days`)
+live in `pipeline/config.py`.
+
 ---
 
 ## Testing
@@ -161,6 +183,7 @@ python -m pytest tests/ -v
 | `test_stage_rank.py` | Stage E: `Composite Score = Technical + fundamentals_weight × Fundamentals`, `Max Score` formula, missing-fundamentals rows treated as 0 (not dropped), sort order (Composite desc, RS 3mo tiebreak), and scores staying within their documented bounds |
 | `test_vcp_metrics.py` | Stage G's numeric VCP detection: a textbook decreasing-pullback pattern is flagged as contracting with volume dry-up; a choppy flat series doesn't false-positive; insufficient history returns `None` |
 | `test_stage_charts.py` | Stage F chart rendering: empty data returns `None` gracefully; valid data writes a real, non-empty PNG |
+| `test_ohlcv_cache.py` | OHLCV cache: fresh data served without fetching, stale cache delta-fetches the tail, cold/too-shallow tickers full-fetch, split-aware merge, delta-failure falls back to stale; market caps reused within TTL and refetched after |
 | `test_ticker_failures.py` | Batch download skips tickers that fail rather than raising |
 
 ---
@@ -280,7 +303,13 @@ docker compose logs -f jupyter
 ```
 data/
 ├── sector_cache.csv        ← cached sector/industry lookups (persists across restarts)
+├── market_cap_cache.csv    ← cached market caps (1-week TTL)
+├── ohlcv_cache/            ← per-ticker Parquet price history (delta-fetched each run)
+│   └── AAPL.parquet
 ├── stage2_watchlist_YYYYMMDD.csv   ← output watchlists
+├── reports/               ← pipeline watchlist + VCP analysis CSVs
+├── charts/                ← VCP chart PNGs
+├── logs/                  ← per-run audit logs
 └── runs/
     └── 20250621_180012_nasdaq_stage2_screener.ipynb  ← timestamped run archives
 ```
@@ -319,3 +348,4 @@ Do **not** expose port 8888 to the public internet without authentication.
 | Notebook not found in runner | Check `NOTEBOOK_NAME` in `.env` matches the filename in `notebooks/` |
 | Stage G (VCP analysis) errors per ticker | Set `ANTHROPIC_API_KEY` in `.env` |
 | Pipeline sector cache stale | Delete `data/sector_cache.csv` (separate from the notebook's own cache) and re-run |
+| Suspect stale/corrupt cached prices | Delete `data/ohlcv_cache/` (or a single `<SYMBOL>.parquet`) to force a full re-download, or set `OHLCV_CACHE=0` |

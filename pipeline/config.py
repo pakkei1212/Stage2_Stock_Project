@@ -34,6 +34,19 @@ CONFIG = {
     "batch_sleep_sec":  1.0,
     "max_retries":      3,
 
+    # OHLCV cache (pipeline/ohlcv_cache.py) — persist downloaded price history
+    # between runs and fetch only the delta each week. Big runtime + rate-limit
+    # win, and accumulates history for backtesting.
+    "ohlcv_cache_enabled":       os.environ.get("OHLCV_CACHE", "1") != "0",
+    "ohlcv_cache_dir":           os.path.join("data", "ohlcv_cache"),
+    "ohlcv_cache_max_age_days":  1,   # cache newer than this (vs today) is served as-is
+    "ohlcv_cache_overlap_days":  5,   # re-fetch this much overlap to catch splits on append
+
+    # Market-cap cache — caps barely move week to week; reuse within the TTL
+    # instead of the slow per-ticker throttled fetch.
+    "market_cap_cache_path":     os.path.join("data", "market_cap_cache.csv"),
+    "market_cap_cache_ttl_days": 7,
+
     # Set to e.g. 300 for a fast test run; None = full universe
     "max_universe_for_testing": None,
 
@@ -45,6 +58,10 @@ CONFIG = {
     "vcp_top_n":            int(os.environ.get("VCP_TOP_N", 20)),
     "vcp_pivot_window_days": 5,       # local-high/low detection window for contraction analysis
     "anthropic_model":       os.environ.get("ANTHROPIC_MODEL", "claude-opus-4-8"),
+    # Render a metrics-verification chart per analyzed symbol (pivots,
+    # contraction depths, pivot/current price, volume halves overlaid) into
+    # chart_dir/vcp_debug/ so the computed numbers can be eyeballed vs the chart.
+    "vcp_debug_charts":      os.environ.get("VCP_DEBUG_CHARTS", "1") != "0",
 
     # Output
     "report_dir": os.path.join("data", "reports"),

@@ -16,9 +16,21 @@ import pandas as pd
 import requests
 import yfinance as yf
 
+from . import ohlcv_cache
 from .config import CONFIG, get_sector_cache_path
 
 logger = logging.getLogger(__name__)
+
+# Wikipedia (and some other sites) 403 requests carrying urllib's default
+# User-Agent — pd.read_html() doesn't let you set headers, so fetch the HTML
+# ourselves with a browser-like UA and hand pandas the text instead of a URL.
+_HTTP_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; research-screener/1.0)"}
+
+
+def _fetch_text(url, timeout=15):
+    resp = requests.get(url, headers=_HTTP_HEADERS, timeout=timeout)
+    resp.raise_for_status()
+    return resp.text
 
 
 def _call_with_retries(fn, retries=3, delay=2, default=None, label="yfinance call"):
@@ -36,6 +48,11 @@ def _call_with_retries(fn, retries=3, delay=2, default=None, label="yfinance cal
     return default if default is not None else None
 
 
+# Maps raw scraped sector labels -> Yahoo Finance's sector taxonomy (what
+# yfinance's own .info["sector"] returns, for consistency across all 3 tiers
+# in get_sector_map). Covers both GICS (S&P 500 Wikipedia table) and ICB
+# (NASDAQ-100 Wikipedia table) labels; entries already spelled the Yahoo way
+# (e.g. "Technology", "Industrials") fall through .get()'s default unchanged.
 GICS_TO_YAHOO = {
     "Information Technology": "Technology",
     "Financials":             "Financial Services",
@@ -43,6 +60,7 @@ GICS_TO_YAHOO = {
     "Consumer Staples":       "Consumer Defensive",
     "Health Care":            "Healthcare",
     "Communication Services": "Communication Services",
+    "Telecommunications":     "Communication Services",  # ICB label (NASDAQ-100 table)
     "Industrials":            "Industrials",
     "Materials":              "Basic Materials",
     "Real Estate":            "Real Estate",
@@ -80,10 +98,8 @@ GICS_INDUSTRY_TO_YAHOO = {
 def get_nasdaq_universe():
     """Pull full NASDAQ-listed symbol directory from Nasdaq Trader."""
     url = "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; research-screener/1.0)"}
-    resp = requests.get(url, headers=headers, timeout=15)
-    resp.raise_for_status()
-    lines = [l for l in resp.text.strip().split("\n")
+    text = _fetch_text(url)
+    lines = [l for l in text.strip().split("\n")
              if not l.startswith("File Creation Time")]
     df = pd.read_csv(io.StringIO("\n".join(lines)), sep="|")
     df = df[(df["ETF"] == "N") & (df["Test Issue"] == "N")].copy()
@@ -94,8 +110,8 @@ def get_nasdaq_universe():
 
 def fallback_nasdaq100():
     """Fallback: NASDAQ-100 constituents from Wikipedia."""
-    url = "https://en.wikipedia.org/wiki/Nasdaq-100"
-    tables = pd.read_html(url)
+    url = "https://en.wikipedia.org/wiki/List_of_NASDAQ-100_companies"
+    tables = pd.read_html(io.StringIO(_fetch_text(url)))
     for t in tables:
         if "Ticker" in t.columns or "Symbol" in t.columns:
             col = "Ticker" if "Ticker" in t.columns else "Symbol"
@@ -120,9 +136,31 @@ def load_universe(config=CONFIG):
 
 # ─────────────────────── Stage B: liquidity + market cap ──────────────────
 
-def batch_download(tickers, period="1mo", interval="1d", config=CONFIG):
-    """Batch-download OHLCV for a list of tickers with retries and sleep between batches."""
+def _period_to_days(period):
+    """Approximate a yfinance period string ('400d', '1mo', '1y') as calendar days.
+    Unrecognised/'max'-like values return a large number so the cache treats the
+    request as needing full history."""
+    p = str(period).strip().lower()
+    try:
+        if p.endswith("mo"):
+            return int(p[:-2]) * 30
+        if p.endswith("d"):
+            return int(p[:-1])
+        if p.endswith("y"):
+            return int(p[:-1]) * 365
+        if p.endswith("wk"):
+            return int(p[:-2]) * 7
+    except ValueError:
+        pass
+    return 3650
+
+
+def _download_batches(tickers, config, interval="1d", **dl_kwargs):
+    """Batched OHLCV download with retries + per-ticker fallback. Parameterised
+    by yfinance download kwargs (``period=`` for a full window, or
+    ``start=``/``end=`` for a delta). Returns {ticker: DataFrame}."""
     all_data = {}
+    tickers = list(tickers)
     batch_size = config["batch_size"]
     n_batches = (len(tickers) + batch_size - 1) // batch_size
 
@@ -133,9 +171,8 @@ def batch_download(tickers, period="1mo", interval="1d", config=CONFIG):
         for attempt in range(config["max_retries"]):
             try:
                 data = yf.download(
-                    batch, period=period, interval=interval,
-                    group_by="ticker", auto_adjust=True,
-                    progress=False, threads=True,
+                    batch, interval=interval, group_by="ticker",
+                    auto_adjust=True, progress=False, threads=True, **dl_kwargs,
                 )
                 break
             except Exception as e:
@@ -148,8 +185,7 @@ def batch_download(tickers, period="1mo", interval="1d", config=CONFIG):
                 try:
                     single = _call_with_retries(
                         lambda _t=t: yf.download(
-                            _t, period=period, interval=interval,
-                            auto_adjust=True, progress=False,
+                            _t, interval=interval, auto_adjust=True, progress=False, **dl_kwargs,
                         ),
                         retries=config["max_retries"],
                         delay=2,
@@ -168,9 +204,14 @@ def batch_download(tickers, period="1mo", interval="1d", config=CONFIG):
 
         for t in batch:
             try:
-                df_t = data if len(batch) == 1 else (
-                    data[t] if t in data.columns.get_level_values(0) else None
-                )
+                # group_by="ticker" makes the ticker the outer column level, so
+                # data[t] yields flat OHLCV columns for both single- and
+                # multi-ticker batches. (A 1-ticker batch still comes back
+                # MultiIndex as ('AAPL','Open') — selecting data[t] flattens it.)
+                if isinstance(data.columns, pd.MultiIndex):
+                    df_t = data[t] if t in data.columns.get_level_values(0) else None
+                else:
+                    df_t = data  # already-flat single-ticker frame
                 if df_t is not None and not df_t.dropna(how="all").empty:
                     all_data[t] = df_t.dropna(how="all")
             except Exception:
@@ -180,6 +221,78 @@ def batch_download(tickers, period="1mo", interval="1d", config=CONFIG):
         time.sleep(config["batch_sleep_sec"])
 
     return all_data
+
+
+def _window(df, start_needed):
+    """Return the slice of ``df`` from ``start_needed`` onward."""
+    return df[df.index >= start_needed].copy()
+
+
+def batch_download(tickers, period="1mo", interval="1d", config=CONFIG, use_cache=None):
+    """Batch-download OHLCV for a list of tickers.
+
+    When the Parquet cache is enabled (``config['ohlcv_cache_enabled']``), each
+    ticker is served one of three ways, minimising network work:
+      - **cache hit**: fresh + deep enough → returned straight from disk
+      - **delta**: deep enough but stale → fetch only the days since the last
+        cached bar, then append (with split-aware merge)
+      - **full**: missing (cold) or not enough history depth → fetch the whole
+        ``period`` window
+    Newly fetched data is merged back into the cache. Returns {ticker: DataFrame}.
+    """
+    tickers = list(tickers)
+    if use_cache is None:
+        use_cache = config.get("ohlcv_cache_enabled", False)
+
+    if not use_cache:
+        return _download_batches(tickers, config, interval=interval, period=period)
+
+    cache_dir = config.get("ohlcv_cache_dir", os.path.join("data", "ohlcv_cache"))
+    max_age = config.get("ohlcv_cache_max_age_days", 1)
+    overlap_days = config.get("ohlcv_cache_overlap_days", 5)
+    today = pd.Timestamp(pd.Timestamp.now("UTC").date())
+    start_needed = today - pd.Timedelta(days=_period_to_days(period))
+
+    result, full, delta = {}, [], {}
+    for t in tickers:
+        cached = ohlcv_cache.load(t, cache_dir)
+        if cached is None:
+            full.append(t)
+        elif not ohlcv_cache.covers(cached, start_needed):
+            full.append(t)                                  # need deeper history
+        elif ohlcv_cache.is_fresh(cached, today, max_age):
+            result[t] = _window(cached, start_needed)       # serve straight from cache
+        else:
+            delta[t] = cached                               # deep enough but stale → append
+
+    logger.info(
+        "OHLCV cache: %d served from disk, %d delta-fetch, %d full-fetch (of %d).",
+        len(result), len(delta), len(full), len(tickers),
+    )
+
+    if full:
+        fetched = _download_batches(full, config, interval=interval, period=period)
+        for t, df in fetched.items():
+            merged = ohlcv_cache.merge(ohlcv_cache.load(t, cache_dir), df)
+            ohlcv_cache.save(t, merged, cache_dir)
+            result[t] = _window(merged, start_needed)
+
+    if delta:
+        oldest_last = min(pd.to_datetime(c.index.max()) for c in delta.values())
+        start = (oldest_last - pd.Timedelta(days=overlap_days)).strftime("%Y-%m-%d")
+        end = (today + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        fetched = _download_batches(list(delta), config, interval=interval, start=start, end=end)
+        for t, cached in delta.items():
+            new = fetched.get(t)
+            if new is not None and not new.empty:
+                merged = ohlcv_cache.merge(cached, new)
+                ohlcv_cache.save(t, merged, cache_dir)
+                result[t] = _window(merged, start_needed)
+            else:
+                logger.debug("%s: delta fetch empty — serving stale cached window", t)
+                result[t] = _window(cached, start_needed)   # stale beats nothing
+
+    return result
 
 
 def cheap_liquidity_filter(universe_df, config=CONFIG):
@@ -225,12 +338,67 @@ def _get_market_cap_timeout(ticker, timeout_sec=8):
     return np.nan
 
 
+def _load_market_cap_cache(path, ttl_days):
+    """Return {Symbol: Market Cap} for entries newer than ttl_days (market caps
+    barely move week to week, so re-fetching every run wastes minutes of the
+    per-ticker, throttled loop below)."""
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        df = pd.read_csv(path)
+        df["AsOf"] = pd.to_datetime(df["AsOf"])
+        cutoff = pd.Timestamp(pd.Timestamp.now("UTC").date()) - pd.Timedelta(days=ttl_days)
+        fresh = df[df["AsOf"] >= cutoff]
+        return dict(zip(fresh["Symbol"], fresh["Market Cap"]))
+    except Exception:
+        logger.warning("Market cap cache read failed — ignoring", exc_info=True)
+        return {}
+
+
+def _update_market_cap_cache(path, newly_fetched):
+    """Merge freshly-fetched caps (stamped today) into the CSV, keeping the
+    latest AsOf per symbol."""
+    if not path or not newly_fetched:
+        return
+    today = pd.Timestamp(pd.Timestamp.now("UTC").date())
+    new_df = pd.DataFrame(
+        [{"Symbol": s, "Market Cap": c, "AsOf": today} for s, c in newly_fetched.items()]
+    )
+    try:
+        if os.path.exists(path):
+            existing = pd.read_csv(path)
+            existing["AsOf"] = pd.to_datetime(existing["AsOf"])
+            combined = pd.concat([existing, new_df], ignore_index=True)
+        else:
+            combined = new_df
+        combined = (combined.sort_values("AsOf")
+                    .drop_duplicates("Symbol", keep="last")
+                    .sort_values("Symbol"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        combined.to_csv(path, index=False)
+    except Exception:
+        logger.warning("Market cap cache write failed", exc_info=True)
+
+
 def market_cap_filter(tickers, config=CONFIG):
     """Stage B part 2: market-cap filter (mid+large cap only)."""
     rows, survivors = [], []
-    logger.info("Fetching market cap for %d liquidity survivors...", len(tickers))
-    for i, t in enumerate(tickers):
-        market_cap = _get_market_cap_timeout(t)
+    cache_path = config.get("market_cap_cache_path")
+    ttl_days = config.get("market_cap_cache_ttl_days", 7)
+    cached_caps = _load_market_cap_cache(cache_path, ttl_days) if cache_path else {}
+    newly_fetched, reused = {}, 0
+
+    logger.info("Fetching market cap for %d liquidity survivors (%d fresh in cache)...",
+                len(tickers), len(cached_caps))
+    for t in tickers:
+        if t in cached_caps and pd.notna(cached_caps[t]):
+            market_cap = cached_caps[t]
+            reused += 1
+        else:
+            market_cap = _get_market_cap_timeout(t)
+            if pd.notna(market_cap):
+                newly_fetched[t] = market_cap
+            time.sleep(0.3)
         min_cap = config["min_market_cap"] or 0
         max_cap = config["max_market_cap"] or np.inf
         passes = pd.notna(market_cap) and (min_cap <= market_cap <= max_cap)
@@ -239,9 +407,11 @@ def market_cap_filter(tickers, config=CONFIG):
             survivors.append(t)
         else:
             logger.debug("%s: market cap %s outside [%s, %s] — dropped.", t, market_cap, min_cap, max_cap)
-        time.sleep(0.3)
+
+    _update_market_cap_cache(cache_path, newly_fetched)
     cap_df = pd.DataFrame(rows)
-    logger.info("Market cap filter: %d / %d are mid/large cap.", len(survivors), len(tickers))
+    logger.info("Market cap filter: %d / %d are mid/large cap (%d reused from cache).",
+                len(survivors), len(tickers), reused)
     return survivors, cap_df
 
 
@@ -260,12 +430,12 @@ def _build_wikipedia_sector_map():
          "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
          "Symbol", "GICS Sector", "GICS Sub-Industry"),
         ("NASDAQ-100",
-         "https://en.wikipedia.org/wiki/Nasdaq-100",
-         "Ticker", "GICS Sector", "GICS Sub-Industry"),
+         "https://en.wikipedia.org/wiki/List_of_NASDAQ-100_companies",
+         "Ticker", "ICB Industry[1]", "ICB Subsector[1]"),
     ]
     for name, url, sym_col, sec_col, ind_col in sources:
         try:
-            tables = pd.read_html(url)
+            tables = pd.read_html(io.StringIO(_fetch_text(url)))
             df = next((t for t in tables
                        if sym_col in t.columns and sec_col in t.columns), None)
             if df is None:

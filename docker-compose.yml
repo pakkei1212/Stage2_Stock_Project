@@ -13,6 +13,8 @@ x-common-env: &common-env
   VCP_TOP_N: ${VCP_TOP_N:-20}
   # Pipeline logging verbosity — DEBUG/INFO/WARNING/ERROR (see pipeline/logging_config.py)
   LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  # OHLCV price cache — set to 0 to disable and always download fresh (see pipeline/ohlcv_cache.py)
+  OHLCV_CACHE: ${OHLCV_CACHE:-1}
 
 services:
 

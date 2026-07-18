@@ -4,6 +4,9 @@ pandas==3.0.2
 numpy==2.4.4
 requests==2.33.1
 
+# Parquet engine for the OHLCV price cache (pipeline/ohlcv_cache.py)
+pyarrow==25.0.0
+
 # Claude API — vision-based VCP entry analysis (pipeline/stage_vcp_analysis.py)
 anthropic==0.116.0
 
