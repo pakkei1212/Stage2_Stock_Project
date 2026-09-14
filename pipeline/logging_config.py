@@ -20,9 +20,13 @@ from .config import CONFIG
 _configured = False
 
 
-def setup_logging(config=CONFIG):
+def setup_logging(config=CONFIG, run_timestamp=None):
     """Idempotent — safe to call more than once; only configures handlers on
-    the first call. Returns the "pipeline" logger."""
+    the first call. Returns the "pipeline" logger.
+
+    ``run_timestamp`` (YYYYMMDD_HHMMSS) names the audit log file; pass the same
+    value used for the run's chart subdirectory so the two line up. Defaults to
+    the current time if not given."""
     logger = logging.getLogger("pipeline")
 
     global _configured
@@ -30,7 +34,7 @@ def setup_logging(config=CONFIG):
         return logger
 
     os.makedirs(config["log_dir"], exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = run_timestamp or datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = os.path.join(config["log_dir"], f"pipeline_{timestamp}.log")
 
     fmt = logging.Formatter(

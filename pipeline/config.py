@@ -58,9 +58,13 @@ CONFIG = {
     "vcp_top_n":            int(os.environ.get("VCP_TOP_N", 20)),
     "vcp_pivot_window_days": 5,       # local-high/low detection window for contraction analysis
     "anthropic_model":       os.environ.get("ANTHROPIC_MODEL", "claude-opus-4-8"),
+    # Send charts + metrics to Claude for the VCP verdict (spends tokens). Set
+    # VCP_LIVE_ANALYSIS=0 for token-free runs that compute metrics and render
+    # the verification charts only, skipping the paid vision call.
+    "vcp_live_analysis":     os.environ.get("VCP_LIVE_ANALYSIS", "1") != "0",
     # Render a metrics-verification chart per analyzed symbol (pivots,
-    # contraction depths, pivot/current price, volume halves overlaid) into
-    # chart_dir/vcp_debug/ so the computed numbers can be eyeballed vs the chart.
+    # contraction depths, pivot/current price, per-contraction volume overlaid)
+    # into chart_dir/vcp_debug/ so the computed numbers can be eyeballed vs the chart.
     "vcp_debug_charts":      os.environ.get("VCP_DEBUG_CHARTS", "1") != "0",
 
     # Output

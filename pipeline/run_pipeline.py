@@ -25,7 +25,13 @@ logger = logging.getLogger(__name__)
 
 
 def main(config=CONFIG):
-    setup_logging(config)
+    run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    setup_logging(config, run_timestamp=run_ts)
+
+    # Isolate each run's charts in their own subdirectory (data/charts/<run_ts>/)
+    # so successive runs don't overwrite one another; the folder name matches the
+    # run's audit log (pipeline_<run_ts>.log). vcp_debug charts nest under it too.
+    config = {**config, "chart_dir": os.path.join(config["chart_dir"], run_ts)}
 
     logger.info("Stage 2 Screener — weekly pipeline run starting, %s", datetime.now().isoformat())
     logger.debug("Config: %s", config)

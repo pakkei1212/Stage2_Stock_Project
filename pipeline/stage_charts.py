@@ -38,12 +38,16 @@ def render_chart(ticker, df, config=CONFIG):
         return None
 
     close = df["Close"]
+    ema10 = close.ewm(span=10, adjust=False).mean()
+    ema21 = close.ewm(span=21, adjust=False).mean()
     ma50 = close.rolling(50).mean()
     ma150 = close.rolling(150).mean()
     ma200 = close.rolling(200).mean()
 
     window = config["chart_lookback_days"]
     plot_df = df.iloc[-window:]
+    plot_ema10 = ema10.iloc[-window:]
+    plot_ema21 = ema21.iloc[-window:]
     plot_ma50 = ma50.iloc[-window:]
     plot_ma150 = ma150.iloc[-window:]
     plot_ma200 = ma200.iloc[-window:]
@@ -68,10 +72,17 @@ def render_chart(ticker, df, config=CONFIG):
     ax_price.bar(xs, height=np.abs(c - o), bottom=np.minimum(o, c),
                  width=0.7, color=candle_colors, linewidth=0, zorder=2)
 
+    # EMA10 (dashed) / EMA21 (dotted) make short-term extension legible: when the recent
+    # candles pull far away from these lines, price is stretched and a low-risk entry has
+    # passed. EMAs (Minervini's 10/21-day) react faster to the recent run than SMAs.
+    ax_price.plot(xs, plot_ema10.to_numpy(), label="EMA10", linewidth=0.9,
+                  color="tab:gray", linestyle="--", zorder=3)
+    ax_price.plot(xs, plot_ema21.to_numpy(), label="EMA21", linewidth=0.9,
+                  color="tab:brown", linestyle=":", zorder=3)
     ax_price.plot(xs, plot_ma50.to_numpy(), label="MA50", linewidth=1, color="tab:orange", zorder=3)
     ax_price.plot(xs, plot_ma150.to_numpy(), label="MA150", linewidth=1, color="tab:blue", zorder=3)
     ax_price.plot(xs, plot_ma200.to_numpy(), label="MA200", linewidth=1, color="tab:purple", zorder=3)
-    ax_price.set_title(f"{ticker} — Daily Candlesticks with 50/150/200-day MAs")
+    ax_price.set_title(f"{ticker} — Daily Candlesticks with 10/21 EMA + 50/150/200 SMA")
     ax_price.legend(loc="upper left")
     ax_price.grid(alpha=0.3)
 

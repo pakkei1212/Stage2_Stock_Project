@@ -152,6 +152,28 @@ def compute_vcp_metrics(df, config=CONFIG, return_details=False):
     pct_below_pivot = (pivot_price_candidate - current_price) / pivot_price_candidate \
         if pivot_price_candidate else np.nan
 
+    # Extension from the short/intermediate MAs — how far price has run away from
+    # its moving averages. A late/climax entry is stretched well above the 10/21
+    # EMA and the 50-day even when the base pattern itself looks clean; the
+    # low-risk buy is near those lines, not extended above them. Short-term
+    # extension uses the 10- and 21-day EMAs (Minervini's convention — EMAs react
+    # faster to the recent run than SMAs); the intermediate reference stays the
+    # 50-day SMA. Computed off the full df so the 50-day window has enough history
+    # (base alone is only chart_lookback_days long).
+    full_close = df["Close"]
+
+    def _pct_ext_ema(span):
+        ema = full_close.ewm(span=span, adjust=False).mean().iloc[-1]
+        return (current_price - ema) / ema * 100 if pd.notna(ema) and ema else np.nan
+
+    def _pct_ext_sma(span):
+        ma = full_close.rolling(span).mean().iloc[-1]
+        return (current_price - ma) / ma * 100 if pd.notna(ma) and ma else np.nan
+
+    pct_ext_ema10 = _pct_ext_ema(10)
+    pct_ext_ema21 = _pct_ext_ema(21)
+    pct_ext_ma50 = _pct_ext_sma(50)
+
     metrics = {
         "contraction_pcts": [round(float(c) * 100, 2) for c in contractions],
         "contraction_count": len(contractions),
@@ -163,6 +185,9 @@ def compute_vcp_metrics(df, config=CONFIG, return_details=False):
         "pivot_price_candidate": round(float(pivot_price_candidate), 2),
         "current_price": round(current_price, 2),
         "pct_below_pivot": round(float(pct_below_pivot) * 100, 2) if pd.notna(pct_below_pivot) else None,
+        "pct_ext_ema10": round(float(pct_ext_ema10), 2) if pd.notna(pct_ext_ema10) else None,
+        "pct_ext_ema21": round(float(pct_ext_ema21), 2) if pd.notna(pct_ext_ema21) else None,
+        "pct_ext_ma50": round(float(pct_ext_ma50), 2) if pd.notna(pct_ext_ma50) else None,
     }
 
     if return_details:
@@ -197,6 +222,8 @@ def render_vcp_annotated_chart(ticker, df, config=CONFIG, out_dir=None):
     close = base["Close"]
 
     full_close = df["Close"]
+    ema10 = full_close.ewm(span=10, adjust=False).mean().reindex(idx)
+    ema21 = full_close.ewm(span=21, adjust=False).mean().reindex(idx)
     ma50 = full_close.rolling(50).mean().reindex(idx)
     ma150 = full_close.rolling(150).mean().reindex(idx)
     ma200 = full_close.rolling(200).mean().reindex(idx)
@@ -207,6 +234,8 @@ def render_vcp_annotated_chart(ticker, df, config=CONFIG, out_dir=None):
     )
 
     ax_price.plot(idx, close, label="Close", linewidth=1.4, color="black")
+    ax_price.plot(idx, ema10, label="EMA10", linewidth=0.9, color="tab:gray", linestyle="--")
+    ax_price.plot(idx, ema21, label="EMA21", linewidth=0.9, color="tab:brown", linestyle=":")
     ax_price.plot(idx, ma50, label="MA50", linewidth=1, color="tab:orange")
     ax_price.plot(idx, ma150, label="MA150", linewidth=1, color="tab:blue")
     ax_price.plot(idx, ma200, label="MA200", linewidth=1, color="tab:red")
@@ -255,6 +284,11 @@ def render_vcp_annotated_chart(ticker, df, config=CONFIG, out_dir=None):
             f"current: {metrics['current_price']}",
             f"pct below pivot: {metrics['pct_below_pivot']}%",
         ]),
+        "   |   ".join([
+            f"ext EMA10: {metrics['pct_ext_ema10']}%",
+            f"ext EMA21: {metrics['pct_ext_ema21']}%",
+            f"ext MA50: {metrics['pct_ext_ma50']}%",
+        ]),
     ])
 
     ax_price.set_title(f"{ticker} — VCP metrics verification")
@@ -293,6 +327,20 @@ def render_vcp_annotated_chart(ticker, df, config=CONFIG, out_dir=None):
 
 
 def _build_prompt(ticker, metrics):
+    pct_below = metrics["pct_below_pivot"]
+    if pct_below is None:
+        proximity_line = "- Current price vs. pivot: unavailable"
+    elif pct_below >= 0:
+        proximity_line = f"- Current price is {pct_below}% below the pivot"
+    else:
+        proximity_line = (
+            f"- Current price is {abs(pct_below)}% ABOVE the candidate pivot — price has "
+            "already cleared that swing-high level. This usually means the pivot is stale "
+            "(no new swing high has been confirmed since, often because price has been "
+            "trending up without a 5+ day pullback) rather than that price is freshly "
+            "breaking out. Judge from the chart whether this is a fresh breakout still near "
+            "the pivot or an extended move well past it."
+        )
     return f"""You are analyzing {ticker} for a Minervini-style Volatility Contraction
 Pattern (VCP) entry setup. A VCP is a base that forms *within a Stage 2 uptrend*:
 price consolidates through a series of pullbacks, each shallower than the last
@@ -311,7 +359,8 @@ chart to judge trend, visual shape, base structure, and quality):
 - Volume dry-up ratio, last contraction's avg vs the first's (<1.0 = drying up): {metrics['volume_dryup_ratio']}
 - Candidate pivot (most recent swing high, close-based — chart wicks may exceed it): {metrics['pivot_price_candidate']}
 - Current price: {metrics['current_price']}
-- Current price is {metrics['pct_below_pivot']}% below the pivot
+{proximity_line}
+- Extension above EMA10 / EMA21 / MA50 (% price sits above each; high = stretched): {metrics['pct_ext_ema10']}% / {metrics['pct_ext_ema21']}% / {metrics['pct_ext_ma50']}%
 
 How to judge:
 - Trend first: a VCP is only valid in a Stage 2 uptrend. Confirm on the chart that
@@ -329,6 +378,17 @@ How to judge:
 - Proximity: an actionable entry needs price coiling *near* the pivot (within a few %).
   Price far below the pivot (e.g. >15-20%) means the base has not formed at the pivot —
   it is mid-drawdown, not a tradeable setup, even if the pullbacks happen to shrink.
+- Extension (climax / chase risk): the low-risk buy is *at* the pivot with price still
+  close to its short/intermediate averages — not after price has already sprinted away
+  from them. Even a clean-looking, tightening base is a poor entry if current price is
+  stretched far above the 50-day (roughly >10-15%) or has run vertically away from the
+  10/21-day EMA (a steep, near-parabolic gap with no recent contact). That is a late,
+  extended move where the reward-to-risk has collapsed and a sharp mean-reversion
+  pullback toward the averages is likely. When price is extended like this, do not call
+  buy_now/breaking_out off the pattern alone — prefer wait_for_better_setup (let a fresh
+  base build closer to the averages) or avoid. Confirm against the MA/EMA lines on the
+  chart; the EMA10 and EMA21 are drawn so you can see how far the recent candles have
+  pulled away from them.
 
 Output guidance:
 - pattern_stage: forming (base building, still loose/early) | mature (tight base formed
@@ -355,7 +415,7 @@ def analyze_chart(client, ticker, chart_path, metrics, config=CONFIG):
 
     response = client.messages.create(
         model=config["anthropic_model"],
-        max_tokens=1024,
+        max_tokens=4096,
         thinking={"type": "adaptive"},
         output_config={
             "effort": "high",
@@ -388,13 +448,13 @@ def run_vcp_analysis(candidates_df, chart_paths, config=CONFIG):
     chart_paths: {symbol: png_path} from stage_charts.generate_charts.
     Returns a DataFrame of VCP verdicts merged with the original ranking columns.
     """
-    # --- TEMP: token-free chart verification (API call disabled) ---
-    # Re-enable the two lines below (and the analyze_chart block further down)
-    # to restore live Claude VCP analysis.
-    # import anthropic
-    # client = anthropic.Anthropic()
+    # Live Claude vision analysis is gated by config so runs can compute metrics
+    # and render verification charts without spending tokens (VCP_LIVE_ANALYSIS=0).
+    live_analysis = config.get("vcp_live_analysis", True)
     client = None
-    # --- END TEMP ---
+    if live_analysis:
+        import anthropic
+        client = anthropic.Anthropic()
 
     rows = []
     for _, row in candidates_df.iterrows():
@@ -419,27 +479,24 @@ def run_vcp_analysis(candidates_df, chart_paths, config=CONFIG):
             except Exception:
                 logger.warning("  %s: failed to render metrics-verification chart", symbol, exc_info=True)
 
-        # --- TEMP: token-free chart verification (API call disabled) ---
-        # The live Claude call is commented out so we can inspect the
-        # metrics-verification charts without spending tokens. Restore the
-        # block below to re-enable it.
-        logger.info("  %s: skipping Claude analysis (token-free mode) — verify chart only", symbol)
-        verdict = {"skipped": "token_free_mode"}
-        # logger.info("  Analyzing %s with %s...", symbol, config["anthropic_model"])
-        # try:
-        #     verdict = analyze_chart(client, symbol, chart_path, metrics, config)
-        #     if "error" in verdict:
-        #         logger.warning("  %s: VCP analysis returned an error verdict: %s", symbol, verdict["error"])
-        #     else:
-        #         logger.info(
-        #             "  %s: verdict=%s stage=%s confidence=%s",
-        #             symbol, verdict.get("entry_recommendation"),
-        #             verdict.get("pattern_stage"), verdict.get("confidence"),
-        #         )
-        # except Exception as e:
-        #     logger.error("  %s: VCP analysis failed", symbol, exc_info=True)
-        #     verdict = {"error": str(e)}
-        # --- END TEMP ---
+        if not live_analysis:
+            logger.info("  %s: skipping Claude analysis (token-free mode) — verify chart only", symbol)
+            verdict = {"skipped": "token_free_mode"}
+        else:
+            logger.info("  Analyzing %s with %s...", symbol, config["anthropic_model"])
+            try:
+                verdict = analyze_chart(client, symbol, chart_path, metrics, config)
+                if "error" in verdict:
+                    logger.warning("  %s: VCP analysis returned an error verdict: %s", symbol, verdict["error"])
+                else:
+                    logger.info(
+                        "  %s: verdict=%s stage=%s confidence=%s",
+                        symbol, verdict.get("entry_recommendation"),
+                        verdict.get("pattern_stage"), verdict.get("confidence"),
+                    )
+            except Exception as e:
+                logger.error("  %s: VCP analysis failed", symbol, exc_info=True)
+                verdict = {"error": str(e)}
 
         rows.append({"Symbol": symbol, **metrics, **verdict})
 

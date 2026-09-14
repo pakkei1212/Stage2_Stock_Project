@@ -90,24 +90,34 @@ than detecting it from pixels alone.
 Run it directly:
 
 ```bash
-docker exec stage2_pipeline python -m pipeline.run_pipeline
+# one-shot throwaway container — nothing needs to be running first
+docker compose run --rm --entrypoint python pipeline -m pipeline.run_pipeline
 # or locally, from the project root, with dependencies installed:
 python -m pipeline.run_pipeline
 ```
 
-`docker exec` requires the `stage2_pipeline` container to already exist. It's
-gated behind the `scheduled` Compose profile, so it won't be created by a plain
-`docker compose up jupyter` (or by `docker compose build`). If `docker exec`
-fails with `No such container: stage2_pipeline`, bring it up first:
+The pipeline code is baked into the image at build time, so rebuild after
+editing anything under `pipeline/`. Only the `jupyter` service declares a build
+context — `pipeline` and `runner` just reuse the image it produces, so
+`--build pipeline` is a no-op and the build must be aimed at `jupyter`:
 
 ```bash
-docker compose --profile scheduled up -d --build pipeline
+docker compose build jupyter
 ```
 
-Then retry the `docker exec` command above. This starts the container on its
-cron schedule (`PIPELINE_SCHEDULE`, default Fridays 21:00 UTC) — `docker exec`
-just lets you trigger an on-demand run inside it without waiting for that
-schedule.
+`docker exec stage2_pipeline ...` also works, but requires the long-lived
+`stage2_pipeline` container to already exist. It's gated behind the `scheduled`
+Compose profile, so it won't be created by a plain `docker compose up jupyter`.
+If `docker exec` fails with `No such container: stage2_pipeline`, bring it up
+first:
+
+```bash
+docker compose --profile scheduled up -d pipeline
+```
+
+That starts the container on its cron schedule (`PIPELINE_SCHEDULE`, default
+Fridays 21:00 UTC) — `docker exec` then lets you trigger an on-demand run inside
+it without waiting for that schedule.
 
 Or let it run on a schedule via the `pipeline` service (see below). Set
 `ANTHROPIC_API_KEY` in `.env` first — Stage G is skipped with an error per
