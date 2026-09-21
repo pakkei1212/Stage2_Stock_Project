@@ -18,7 +18,9 @@ from .config import CONFIG
 from .logging_config import setup_logging
 from .stage_vcp_analysis import run_vcp_analysis
 
-logger = logging.getLogger(__name__)
+# Explicit name: under `python -m pipeline.run_vcp_only` __name__ is "__main__",
+# which would detach this logger from the configured "pipeline" tree.
+logger = logging.getLogger("pipeline.run_vcp_only")
 
 
 def _latest_watchlist(report_dir):

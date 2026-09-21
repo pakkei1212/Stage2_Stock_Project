@@ -4,10 +4,24 @@ None of these tests hit the network — every yfinance/requests/Anthropic call i
 monkeypatched with deterministic fake data so the assertions are exact and
 reproducible, not "some real ticker happened to pass".
 """
+import socket
+
 import numpy as np
 import pandas as pd
+import pytest
 
 HI_VOL = 2_000_000
+
+
+@pytest.fixture(autouse=True)
+def _no_network(monkeypatch):
+    """Any attempt to open a network connection fails the test loudly."""
+    def _blocked(*args, **kwargs):
+        raise RuntimeError("tests must not access the network")
+    monkeypatch.setattr(socket.socket, "connect", _blocked)
+    monkeypatch.setattr(socket, "create_connection", _blocked)
+    for key in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
+        monkeypatch.delenv(key, raising=False)
 LO_VOL = 800_000
 
 
@@ -39,6 +53,32 @@ def make_ohlcv(n=400, start=50.0, daily_drift=0.15, noise_scale=0.3, seed=0, vol
     return pd.DataFrame(
         {"Open": open_, "High": high, "Low": low, "Close": close, "Volume": volume},
         index=dates,
+    )
+
+
+def make_path_df(segments, start_price=50.0, lead_in_bars=150, lead_in_top=100.0,
+                 lead_in_volume=5_000_000.0, wick=0.003):
+    """Deterministic piecewise-linear daily OHLCV (no noise) for VCP structure tests.
+
+    A steady lead-in rally (Stage 2 context + MA history) climbs from
+    ``start_price`` to ``lead_in_top``; then each ``(bars, target_close, volume)``
+    segment moves Close linearly to its target at a constant daily volume.
+    Open = prior close; High/Low add a small ``wick`` around the body, so
+    High/Low depths run slightly deeper than Close-to-Close moves.
+    """
+    closes = list(np.linspace(start_price, lead_in_top, lead_in_bars))
+    volumes = [float(lead_in_volume)] * lead_in_bars
+    price = lead_in_top
+    for bars, target, volume in segments:
+        closes.extend(np.linspace(price, target, bars + 1)[1:])
+        volumes.extend([float(volume)] * bars)
+        price = target
+    close = np.array(closes)
+    open_ = np.r_[close[0], close[:-1]]
+    return pd.DataFrame(
+        {"Open": open_, "High": np.maximum(open_, close) * (1 + wick),
+         "Low": np.minimum(open_, close) * (1 - wick), "Close": close, "Volume": np.array(volumes)},
+        index=pd.bdate_range("2025-01-02", periods=len(close)),
     )
 
 

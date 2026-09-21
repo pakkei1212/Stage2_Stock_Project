@@ -10,6 +10,11 @@ pyarrow==25.0.0
 # Claude API — vision-based VCP entry analysis (pipeline/stage_vcp_analysis.py)
 anthropic==0.116.0
 
+# NASDAQ exchange calendar (holidays, early closes) for session-aware scheduling
+# (pipeline/trading_calendar.py); tzdata backs zoneinfo on slim images/Windows.
+exchange_calendars==4.13.2
+tzdata==2026.2
+
 # HTML parsing — required by pd.read_html() for Wikipedia sector scraping (Stage C / B.5)
 lxml==6.0.2
 

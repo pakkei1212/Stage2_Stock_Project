@@ -233,9 +233,12 @@ def batch_download(tickers, period="1mo", interval="1d", config=CONFIG, use_cach
 
     When the Parquet cache is enabled (``config['ohlcv_cache_enabled']``), each
     ticker is served one of three ways, minimising network work:
-      - **cache hit**: fresh + deep enough → returned straight from disk
-      - **delta**: deep enough but stale → fetch only the days since the last
-        cached bar, then append (with split-aware merge)
+      - **cache hit**: fresh + deep enough, and the newest bar was cached after
+        its session closed → returned straight from disk
+      - **delta**: deep enough but stale, or the newest bar may be partial
+        (cached while its session was still open) → fetch only the days since
+        the last cached bar (plus overlap, which replaces the partial bar),
+        then append (with split-aware merge)
       - **full**: missing (cold) or not enough history depth → fetch the whole
         ``period`` window
     Newly fetched data is merged back into the cache. Returns {ticker: DataFrame}.
@@ -250,10 +253,12 @@ def batch_download(tickers, period="1mo", interval="1d", config=CONFIG, use_cach
     cache_dir = config.get("ohlcv_cache_dir", os.path.join("data", "ohlcv_cache"))
     max_age = config.get("ohlcv_cache_max_age_days", 1)
     overlap_days = config.get("ohlcv_cache_overlap_days", 5)
+    close_buffer = config.get("session_close_buffer_minutes", 60)
     today = pd.Timestamp(pd.Timestamp.now("UTC").date())
     start_needed = today - pd.Timedelta(days=_period_to_days(period))
 
     result, full, delta = {}, [], {}
+    partial = 0
     for t in tickers:
         cached = ohlcv_cache.load(t, cache_dir)
         if cached is None:
@@ -261,13 +266,18 @@ def batch_download(tickers, period="1mo", interval="1d", config=CONFIG, use_cach
         elif not ohlcv_cache.covers(cached, start_needed):
             full.append(t)                                  # need deeper history
         elif ohlcv_cache.is_fresh(cached, today, max_age):
-            result[t] = _window(cached, start_needed)       # serve straight from cache
+            if ohlcv_cache.last_bar_complete(cached, ohlcv_cache.fetched_at(t, cache_dir), close_buffer):
+                result[t] = _window(cached, start_needed)   # serve straight from cache
+            else:
+                delta[t] = cached                           # newest bar may be intraday → refetch it
+                partial += 1
         else:
             delta[t] = cached                               # deep enough but stale → append
 
     logger.info(
-        "OHLCV cache: %d served from disk, %d delta-fetch, %d full-fetch (of %d).",
-        len(result), len(delta), len(full), len(tickers),
+        "OHLCV cache: %d served from disk, %d delta-fetch (%d with a possibly partial last bar), "
+        "%d full-fetch (of %d).",
+        len(result), len(delta), partial, len(full), len(tickers),
     )
 
     if full:
@@ -563,18 +573,28 @@ def rank_sector_strength(sector_df, config=CONFIG):
     return sector_strength.sort_values("Relative Strength", ascending=False).reset_index(drop=True), merged
 
 
-def run_stage_abc(config=CONFIG):
+def run_stage_abc(config=CONFIG, stats=None):
     """Runs Stage A (universe) -> B (liquidity+cap) -> C (sector strength).
 
-    Returns (stage_c_survivors, sector_df, market_cap_stats).
+    Returns (stage_c_survivors, sector_df, market_cap_stats). If ``stats`` (a
+    dict) is given, per-stage survivor counts are recorded into it for run
+    monitoring; screening behaviour is identical either way.
     """
+    stats = {} if stats is None else stats
+    stats["current_stage"] = "A"
     universe_df = load_universe(config)
+    stats["universe"] = len(universe_df)
 
+    stats["current_stage"] = "B"
     liquidity_survivors, _ = cheap_liquidity_filter(universe_df, config)
+    stats["liquidity"] = len(liquidity_survivors)
     stage_b_survivors, market_cap_stats = market_cap_filter(liquidity_survivors, config)
+    stats["market_cap"] = len(stage_b_survivors)
 
+    stats["current_stage"] = "C"
     sector_df = get_sector_map(stage_b_survivors)
     sector_df = sector_df[~sector_df["Sector"].isin(["Unknown", "Timeout"])]
+    stats["sector_classified"] = len(sector_df)
 
     sector_strength, merged_with_returns = rank_sector_strength(sector_df, config)
     top_sectors = sector_strength.head(config["top_n_sectors"])["Sector"].tolist()
@@ -584,5 +604,6 @@ def run_stage_abc(config=CONFIG):
         merged_with_returns["Sector"].isin(top_sectors)
     ]["Symbol"].tolist()
     logger.info("Stage C: %d tickers in top sectors.", len(stage_c_survivors))
+    stats["stage_c"] = len(stage_c_survivors)
 
     return stage_c_survivors, sector_df, market_cap_stats

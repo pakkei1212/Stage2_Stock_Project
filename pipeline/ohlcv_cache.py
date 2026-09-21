@@ -107,6 +107,37 @@ def is_fresh(df, today, max_age_days):
     return (today - last).days <= max_age_days
 
 
+def fetched_at(ticker, cache_dir):
+    """UTC time the ticker's cache file was last written (i.e. last fetched), or None."""
+    try:
+        return pd.Timestamp(os.path.getmtime(cache_path(ticker, cache_dir)), unit="s", tz="UTC")
+    except OSError:
+        return None
+
+
+def last_bar_complete(df, written_at, close_buffer_minutes=60):
+    """False if the newest cached bar may be a partial (intraday) bar.
+
+    yfinance exposes an in-progress session as a daily bar, so a fetch made
+    while the US market is open caches a partial bar dated that session. Such a
+    bar is only trustworthy if it was written after the session's close (+
+    buffer). Unknown write time or a calendar failure counts as incomplete: the
+    caller then delta-fetches, which is slower but never serves a partial bar.
+    """
+    if df is None or df.empty or written_at is None:
+        return False
+    try:
+        from . import trading_calendar as tc
+        last = pd.to_datetime(df.index.max()).date()
+        if not tc.is_trading_session(last):
+            return True
+        done = pd.Timestamp(tc.session_close_utc(last)) + pd.Timedelta(minutes=close_buffer_minutes)
+        return pd.Timestamp(written_at) >= done
+    except Exception:
+        logger.warning("Session-close lookup failed — treating cached last bar as incomplete", exc_info=True)
+        return False
+
+
 def covers(df, start_needed):
     """True if the cache reaches back at least as far as ``start_needed``."""
     if df is None or df.empty:

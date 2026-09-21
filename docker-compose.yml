@@ -17,6 +17,47 @@ x-common-env: &common-env
   OHLCV_CACHE: ${OHLCV_CACHE:-1}
   # Stage G live Claude VCP analysis — set to 0 for token-free runs (metrics + charts only)
   VCP_LIVE_ANALYSIS: ${VCP_LIVE_ANALYSIS:-0}
+  VCP_LLM_REVIEW_MODE: ${VCP_LLM_REVIEW_MODE:-selective}
+  # Stage H: session-aware scheduler (pipeline/scheduler.py) — see README "Scheduled operation"
+  # Main check frequency: SCHEDULE_MODE=daily|times|interval (not the runner's cron SCHEDULE)
+  SCHEDULE_ENABLED: ${SCHEDULE_ENABLED:-1}
+  SCHEDULE_MODE: ${SCHEDULE_MODE:-daily}
+  SCHEDULE_TIMES: ${SCHEDULE_TIMES:-}
+  SCHEDULE_INTERVAL_MINUTES: ${SCHEDULE_INTERVAL_MINUTES:-60}
+  LOCAL_SCHEDULER_TIME: ${LOCAL_SCHEDULER_TIME:-09:15}
+  LOCAL_SCHEDULER_TIMEZONE: ${LOCAL_SCHEDULER_TIMEZONE:-Asia/Singapore}
+  RUN_ON_STARTUP_CHECK: ${RUN_ON_STARTUP_CHECK:-1}
+  DATA_READY_RETRY_MINUTES: ${DATA_READY_RETRY_MINUTES:-10}
+  DATA_READY_MAX_ATTEMPTS: ${DATA_READY_MAX_ATTEMPTS:-3}
+  DEFERRED_RETRY_ENABLED: ${DEFERRED_RETRY_ENABLED:-1}
+  DEFERRED_RETRY_MINUTES: ${DEFERRED_RETRY_MINUTES:-60}
+  DEFERRED_RETRY_CUTOFF: ${DEFERRED_RETRY_CUTOFF:-20:30}
+  HISTORY_DB_PATH: ${HISTORY_DB_PATH:-data/history/stage2_history.sqlite3}
+  TREND_TOP_N: ${TREND_TOP_N:-10}
+  TREND_LOOKBACK_SESSIONS: ${TREND_LOOKBACK_SESSIONS:-10}
+  # Telegram — credentials pass through from .env only; never put real values here
+  TELEGRAM_ENABLED: ${TELEGRAM_ENABLED:-0}
+  TELEGRAM_SEND_CHARTS: ${TELEGRAM_SEND_CHARTS:-1}
+  TELEGRAM_VCP_CHART_MAX: ${TELEGRAM_VCP_CHART_MAX:-10}
+  TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+  TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+  # Stage I: advisory trade journal + position monitor (pipeline/trade_store.py,
+  # pipeline/position_monitor.py). Records fills YOU report and monitors public
+  # market data — there is no brokerage API, no account access and no order
+  # placement anywhere in this project. Planning parameters only.
+  TRADE_JOURNAL_ENABLED: ${TRADE_JOURNAL_ENABLED:-1}
+  TRADE_DB_PATH: ${TRADE_DB_PATH:-data/trades/trade_journal.sqlite3}
+  PORTFOLIO_VALUE: ${PORTFOLIO_VALUE:-100000}
+  RISK_PER_TRADE_PCT: ${RISK_PER_TRADE_PCT:-1.0}
+  MAX_POSITION_PORTION_PCT: ${MAX_POSITION_PORTION_PCT:-25}
+  MAX_RISK_PCT: ${MAX_RISK_PCT:-10}
+  # Telegram trade-journal bot (separate long-poll process: python -m pipeline.trade_bot).
+  # Mutating commands are accepted ONLY from TELEGRAM_ALLOWED_CHAT_ID.
+  TRADE_BOT_ENABLED: ${TRADE_BOT_ENABLED:-0}
+  TELEGRAM_ALLOWED_CHAT_ID: ${TELEGRAM_ALLOWED_CHAT_ID:-}
+  TELEGRAM_ALLOWED_USER_ID: ${TELEGRAM_ALLOWED_USER_ID:-}
+  # Optional: the image has no .git, so pass the commit for run reproducibility metadata
+  GIT_COMMIT: ${GIT_COMMIT:-}
 
 services:
 
@@ -51,6 +92,8 @@ services:
   #   docker compose --profile scheduled up
   #
   # The SCHEDULE env var uses standard cron syntax (default: weekdays at 18:00 local).
+  # SCHEDULE is for this notebook runner only; the `pipeline` service below is
+  # driven by SCHEDULE_MODE / LOCAL_SCHEDULER_TIME / SCHEDULE_TIMES / SCHEDULE_INTERVAL_MINUTES.
   # Output notebooks (with cell outputs) are saved to /app/data/runs/.
   runner:
     image: nasdaq-stage2-screener:latest
@@ -79,13 +122,16 @@ services:
       "
     restart: unless-stopped
 
-  # ── 3. Scheduled weekly pipeline (screen + rank + chart + VCP vision) ──────
-  # Native-Python pipeline (pipeline/run_pipeline.py) — no notebook involved.
+  # ── 3. Session-aware pipeline scheduler (Stage A-G + history + Telegram) ──
+  # Native-Python pipeline driven by pipeline/scheduler.py — the same code the
+  # Windows Task Scheduler setup runs. Long-running: a startup catch-up check,
+  # then checks per SCHEDULE_MODE (default daily at LOCAL_SCHEDULER_TIME, in
+  # LOCAL_SCHEDULER_TIMEZONE), every calendar day. It only runs Stage A-G when the latest completed NASDAQ
+  # session has no successful result yet, so restarts never duplicate runs.
   # Disabled by default (profile: scheduled) — enable with:
-  #   docker compose --profile scheduled up
-  #
-  # PIPELINE_SCHEDULE uses standard cron syntax (default: Fridays 21:00 UTC).
-  # Outputs land in /app/data/reports/ and /app/data/charts/.
+  #   docker compose --profile scheduled up -d pipeline
+  # Run the scheduler in ONE place only (this container OR the Windows task):
+  # file locks are not shared reliably across the Docker Desktop bind mount.
   pipeline:
     image: nasdaq-stage2-screener:latest
     container_name: stage2_pipeline
@@ -93,17 +139,8 @@ services:
       - scheduled
     environment:
       <<: *common-env
-      PIPELINE_SCHEDULE: ${PIPELINE_SCHEDULE:-0 21 * * 5}
     volumes:
       - ./data:/app/data
     working_dir: /app
-    entrypoint: >
-      /bin/sh -c "
-        mkdir -p /app/data/reports /app/data/charts &&
-        CRON_FILE=/etc/cron.d/stage2_pipeline &&
-        echo \"$$PIPELINE_SCHEDULE /bin/sh /app/run_weekly.sh\" > $$CRON_FILE &&
-        chmod 0644 $$CRON_FILE &&
-        echo \"Scheduled job: [$$PIPELINE_SCHEDULE] -> pipeline.run_pipeline\" &&
-        exec cron -f
-      "
+    entrypoint: ["python", "-m", "pipeline.scheduler"]
     restart: unless-stopped
